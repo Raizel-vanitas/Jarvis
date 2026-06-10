@@ -5,6 +5,8 @@ Fully offline. No API keys needed.(Also if it says missing dependencies js insta
 
 ---
 
+# Python 3.14!
+
 ## Files in this package
 
 | File | What it does |
@@ -80,7 +82,7 @@ pipwin install pyaudio
 ## Sending to a friend
 
 Just zip up the whole folder and send it. They need to:
-1. Install Python 3.11 (with "Add to PATH" ticked)
+1. Install Python 3.14 (with "Add to PATH" ticked)
 2. Install Ollama from https://ollama.com
 3. Run `install.bat`
 4. Run `jarvis_gui.py`
