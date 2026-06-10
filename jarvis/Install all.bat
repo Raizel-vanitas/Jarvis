@@ -1,0 +1,1 @@
+python -m pip install --upgrade pip && python -m pip install requests psutil pyttsx3 SpeechRecognition pyaudio edge-tts pygame sounddevice numpy pygetwindow plyer pystray pillow pyautogui pyperclip pywin32
