@@ -26,7 +26,7 @@ try:
 except Exception:
     _PYGAME_OK = False
 
-# If pyaudio is missing, build a lightweight sr.AudioData capture using sounddevice
+
 if not _PYAUDIO_OK:
     try:
         import sounddevice as _sd
@@ -44,7 +44,7 @@ from pystray import Icon, Menu, MenuItem
 from PIL import Image, ImageDraw, ImageTk
 try:
     import pyautogui
-    pyautogui.FAILSAFE = True   # move mouse to top-left corner to abort any action
+    pyautogui.FAILSAFE = True   
     PYAUTOGUI_OK = True
 except Exception as _pag_err:
     print(f"[JARVIS] pyautogui failed to initialise: {_pag_err}")
@@ -56,16 +56,14 @@ try:
 except ImportError:
     PYPERCLIP_OK = False
 
-# ── Reminder queue (thread-safe) ─────────────
+
 _reminder_queue: queue.Queue = queue.Queue()
 
-# ── Notes/Todo storage ───────────────────────
+
 NOTES_FILE = Path(__file__).parent / "jarvis_notes.json"
 
 
-# ─────────────────────────────────────────────
-#  CONFIG
-# ─────────────────────────────────────────────
+
 CONFIG_FILE = Path(__file__).parent / "jarvis_config.json"
 
 DEFAULT_CONFIG = {
@@ -100,18 +98,14 @@ def save_config(cfg: dict):
         json.dump(cfg, f, indent=2)
 
 
-# ─────────────────────────────────────────────
-#  SUSPICIOUS-FILE PATTERNS
-# ─────────────────────────────────────────────
+
 SUSPICIOUS_EXT   = {".exe",".bat",".cmd",".vbs",".ps1",".scr",".pif",".com",".jar",".hta",".jse",".wsf"}
 SUSPICIOUS_NAMES = ["keylog","trojan","rootkit","ransomware","cryptominer","backdoor",
                     "stealer","rat","worm","botnet","exploit","payload","mimikatz","metasploit"]
 TEMP_PATHS       = ["\\temp\\","\\tmp\\","\\appdata\\local\\temp\\","\\appdata\\roaming\\temp\\"]
 
 
-# ─────────────────────────────────────────────
-#  MUTABLE STATE
-# ─────────────────────────────────────────────
+
 chat_history = []
 tts_engine   = None
 tray_icon    = None
@@ -120,19 +114,16 @@ running      = True
 gui_app      = None   # reference to the main GUI window
 
 
-# ─────────────────────────────────────────────
-#  TTS
-# ─────────────────────────────────────────────
-# ── Edge TTS voice (neural, sounds human) ────
-_JARVIS_VOICE   = "en-GB-RyanNeural"   # closest to MCU JARVIS — British male neural
-_JARVIS_RATE    = "-5%"                 # slightly slower than default
-_JARVIS_PITCH   = "-8Hz"               # just a touch lower
+
+_JARVIS_VOICE   = "en-GB-RyanNeural"  
+_JARVIS_RATE    = "-5%"                 
+_JARVIS_PITCH   = "-8Hz"               
 
 def init_tts():
     """Initialise pyttsx3 as fallback only; edge-tts is used when available."""
     global tts_engine
     if _EDGE_TTS_OK:
-        tts_engine = None   # edge-tts handles speech; pyttsx3 not needed
+        tts_engine = None  
         return
     try:
         tts_engine = pyttsx3.init()
@@ -172,7 +163,7 @@ def _speak_edge(text: str):
                 import time; time.sleep(0.05)
             pygame.mixer.music.unload()
         else:
-            # Fallback: playsound / os.startfile
+            
             import subprocess as _sp
             _sp.run(["powershell", "-c", f'(New-Object Media.SoundPlayer "{tmp_path}").PlaySync()'],
                     capture_output=True)
@@ -238,9 +229,7 @@ def voice_confirm(prompt: str) -> bool:
     return False
 
 
-# ─────────────────────────────────────────────
-#  SPEECH RECOGNITION
-# ─────────────────────────────────────────────
+
 def _make_recognizer() -> sr.Recognizer:
     r = sr.Recognizer()
     r.energy_threshold         = 300
@@ -250,11 +239,11 @@ def _make_recognizer() -> sr.Recognizer:
 
 def _capture_audio_sounddevice(duration: float = 5, samplerate: int = 16000) -> sr.AudioData:
     """Record audio via sounddevice with voice activity detection."""
-    CHUNK       = int(samplerate * 0.1)   # 100ms chunks
-    SILENCE_DB  = 30                       # RMS threshold for silence
-    MIN_SPEECH  = 0.3                      # seconds of speech before we accept
-    MAX_SILENCE = 1.5                      # seconds of silence after speech to stop
-    MAX_TOTAL   = 15.0                     # hard cap
+    CHUNK       = int(samplerate * 0.1)   
+    SILENCE_DB  = 30                      
+    MIN_SPEECH  = 0.3                     
+    MAX_SILENCE = 1.5                      
+    MAX_TOTAL   = 15.0                     
 
     frames        = []
     speech_frames = 0
@@ -328,13 +317,10 @@ def listen_for_command(prompt_text: str | None = None) -> str | None:
         return None
 
 
-# ─────────────────────────────────────────────
-#  "DID YOU MEAN" — ACCENT-AWARE CORRECTION
-# ─────────────────────────────────────────────
+
 import difflib as _difflib
 
-# Common mishearing substitutions (heard → intended).
-# Covers British/non-rhotic accents, t-glottalling, dropped h's, vowel shifts, etc.
+
 _MISHEARING_MAP = {
     # Wake word variants
     "jarvis": ["jarvus", "jarbus", "jarves", "jarfis", "jarbis", "jarfish", "harvest", "travis"],
@@ -419,8 +405,7 @@ def _apply_corrections(text: str) -> tuple[str, list[tuple[str, str]]]:
             changes.append((word, replacement))
             continue
 
-        # 2. Fuzzy match against known words — only if the word looks like a mishearing
-        #    (i.e. not already a known correct word)
+
         if w_lower not in _ALL_KNOWN and len(w_lower) >= 4:
             close = _difflib.get_close_matches(w_lower, _ALL_KNOWN, n=1, cutoff=0.82)
             if close:
@@ -504,8 +489,7 @@ def build_system_prompt() -> str:
     owner = CFG.get("owner_name", "sir")
     h     = str(HOME_DIR).replace("\\", "/")
 
-    # Few-shot examples teach the model EXACTLY what output format is required.
-    # This is the most reliable way to fix hallucination on small models like llama3.2.
+
     examples = """
 === OUTPUT FORMAT — FOLLOW EXACTLY ===
 
@@ -850,7 +834,7 @@ def open_app(name: str) -> str:
     """
     import difflib, winreg
 
-    # ── 1. Hardcoded map ─────────────────────────────────────────────────────
+   
     KNOWN = {
         # System tools
         "notepad":               "notepad.exe",
@@ -1206,9 +1190,7 @@ def web_search(query: str) -> str:
         return f"Error: {e}"
 
 
-# ─────────────────────────────────────────────
-#  MOUSE / KEYBOARD / BROWSER CONTROL
-# ─────────────────────────────────────────────
+
 def open_link(url: str) -> str:
     """Open a URL in the default browser."""
     if not url.startswith(("http://", "https://")):
@@ -1552,9 +1534,7 @@ def desktop_notify(title: str, message: str):
         pass
 
 
-# ─────────────────────────────────────────────
-#  PIP PACKAGE MANAGER
-# ─────────────────────────────────────────────
+
 def _stream_subprocess(cmd: str, label: str) -> str:
     """Run a shell command, stream stdout/stderr line-by-line to chat, return summary."""
     if gui_app:
@@ -1603,9 +1583,7 @@ def pip_uninstall(packages: str) -> str:
     return _stream_subprocess(cmd, f"pip uninstall {packages}")
 
 
-# ─────────────────────────────────────────────
-#  GIT OPERATIONS
-# ─────────────────────────────────────────────
+
 _GIT_SAFE_CMDS = {"status", "log", "pull", "fetch", "branch", "diff", "stash"}
 
 def git_clone(url: str, dest: str = "") -> str:
@@ -1637,9 +1615,7 @@ def git_run(git_cmd: str, path: str = "") -> str:
     return _stream_subprocess(cmd, f"git {git_cmd}")
 
 
-# ─────────────────────────────────────────────
-#  REAL WEB SEARCH (DuckDuckGo text results)
-# ─────────────────────────────────────────────
+
 def web_search_read(query: str, num_results: int = 5) -> str:
     """Fetch actual text snippets from DuckDuckGo HTML results."""
     try:
@@ -1669,9 +1645,7 @@ def web_search_read(query: str, num_results: int = 5) -> str:
         return f"Could not fetch results directly ({e}). Opened browser instead."
 
 
-# ─────────────────────────────────────────────
-#  WEATHER
-# ─────────────────────────────────────────────
+
 def get_weather(location: str) -> str:
     try:
         url = f"https://wttr.in/{urllib.parse.quote_plus(location)}?format=4"
@@ -1682,9 +1656,7 @@ def get_weather(location: str) -> str:
         return f"Could not retrieve weather: {e}"
 
 
-# ─────────────────────────────────────────────
-#  SCREENSHOT
-# ─────────────────────────────────────────────
+
 def take_screenshot(path: str = "") -> str:
     if not PYAUTOGUI_OK:
         return "pyautogui is required for screenshots. Run: pip install pyautogui"
@@ -1699,9 +1671,7 @@ def take_screenshot(path: str = "") -> str:
         return f"Error taking screenshot: {e}"
 
 
-# ─────────────────────────────────────────────
-#  CLIPBOARD
-# ─────────────────────────────────────────────
+
 def clipboard_read() -> str:
     if not PYPERCLIP_OK:
         return "pyperclip is required. Run: pip install pyperclip"
@@ -1723,9 +1693,7 @@ def clipboard_write(text: str) -> str:
         return f"Error writing to clipboard: {e}"
 
 
-# ─────────────────────────────────────────────
-#  NOTES / TO-DO LIST
-# ─────────────────────────────────────────────
+
 def _load_notes() -> list:
     if NOTES_FILE.exists():
         try:
@@ -1782,9 +1750,7 @@ def delete_note(note_id: int) -> str:
     return f"✅ Note #{note_id} deleted."
 
 
-# ─────────────────────────────────────────────
-#  NETWORK / PING
-# ─────────────────────────────────────────────
+
 def ping_host(host: str) -> str:
     """Ping a host and return latency info."""
     try:
@@ -1830,9 +1796,7 @@ def network_status() -> str:
         return f"Error: {e}"
 
 
-# ─────────────────────────────────────────────
-#  RECENT FILES
-# ─────────────────────────────────────────────
+
 def recent_files(directory: str = "", count: int = 10) -> str:
     """List the most recently modified files in a directory."""
     try:
@@ -1859,9 +1823,7 @@ def recent_files(directory: str = "", count: int = 10) -> str:
         return f"Error: {e}"
 
 
-# ─────────────────────────────────────────────
-#  DISK USAGE BY FOLDER
-# ─────────────────────────────────────────────
+
 def folder_sizes(path: str = "", top_n: int = 10) -> str:
     """Show the largest immediate sub-folders in a directory."""
     try:
@@ -1895,9 +1857,7 @@ def folder_sizes(path: str = "", top_n: int = 10) -> str:
         return f"Error: {e}"
 
 
-# ─────────────────────────────────────────────
-#  VOLUME CONTROL  (Windows only via PowerShell)
-# ─────────────────────────────────────────────
+
 def set_volume(level: int) -> str:
     """Set system volume 0-100 on Windows."""
     level = max(0, min(100, level))
@@ -1925,9 +1885,7 @@ def mute_volume() -> str:
         return f"Could not mute: {e}"
 
 
-# ─────────────────────────────────────────────
-#  REMINDERS
-# ─────────────────────────────────────────────
+
 def set_reminder(message: str, minutes: float) -> str:
     if minutes <= 0 or minutes > 1440:
         return "Reminder must be between 1 and 1440 minutes from now."
@@ -1945,9 +1903,7 @@ def set_reminder(message: str, minutes: float) -> str:
     return f"✅ Reminder set for {eta} ({minutes:.0f} min): {message}"
 
 
-# ─────────────────────────────────────────────
-#  RUN SCRIPT
-# ─────────────────────────────────────────────
+
 _ALLOWED_SCRIPT_EXTS = {".py", ".bat", ".cmd", ".sh", ".ps1"}
 
 def run_script(path: str) -> str:
@@ -2024,11 +1980,7 @@ def dispatch(action: dict) -> str:
         return f"Unknown action: '{a}'"
 
 
-# ─────────────────────────────────────────────
-#  DIRECT INTENT PARSER
-#  Catches unambiguous commands without the AI,
-#  so small models can't hallucinate them away.
-# ─────────────────────────────────────────────
+
 import re as _re
 def _direct_intent(t: str, raw: str):
     """
@@ -2163,9 +2115,7 @@ def _direct_intent(t: str, raw: str):
     return None   # fall through to AI
 
 
-# ─────────────────────────────────────────────
-#  DIRECT INTENT — NEW COMMANDS
-# ─────────────────────────────────────────────
+
 def _direct_intent_extended(t: str, raw: str):
     """Extra direct-intent patterns for new features."""
 
@@ -2416,9 +2366,7 @@ def handle_command(text: str):
     if gui_app: gui_app.set_status("Ready")
 
 
-# ─────────────────────────────────────────────
-#  BACKGROUND HEALTH MONITOR
-# ─────────────────────────────────────────────
+
 def background_monitor():
     while running:
         time.sleep(CFG.get("monitor_interval", 60))
@@ -2437,9 +2385,7 @@ def background_monitor():
             pass
 
 
-# ─────────────────────────────────────────────
-#  SYSTEM TRAY
-# ─────────────────────────────────────────────
+
 def make_tray_image() -> Image.Image:
     """Draw a glowing arc-reactor style tray icon."""
     size = 64
@@ -2491,9 +2437,7 @@ def run_tray():
     tray_icon.run()
 
 
-# ─────────────────────────────────────────────
-#  SETTINGS DIALOG
-# ─────────────────────────────────────────────
+
 class SettingsDialog(tk.Toplevel):
     # Colours mirroring the main window
     BG    = "#0d1117"
@@ -2639,13 +2583,9 @@ class SettingsDialog(tk.Toplevel):
             gui_app.add_message("JARVIS", "Settings saved.", tag="jarvis")
 
 
-# ─────────────────────────────────────────────
-#  MAIN GUI
-# ─────────────────────────────────────────────
 
-# ─────────────────────────────────────────────
-#  LOADING / SPLASH SCREEN
-# ─────────────────────────────────────────────
+
+
 class SplashScreen(tk.Toplevel):
     """
     Arc-reactor style loading screen shown while JARVIS initialises.
@@ -3105,9 +3045,7 @@ def gui_setup_wizard():
     return cfg
 
 
-# ─────────────────────────────────────────────
-#  WINDOWS STARTUP REGISTRATION
-# ─────────────────────────────────────────────
+
 _STARTUP_REG_KEY  = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run"
 _STARTUP_REG_NAME = "JARVIS_Vanitas"
 
