@@ -1,7 +1,7 @@
 # JARVIS — GUI Edition
 
 A voice-activated AI assistant with a dark interface, powered by Ollama (llama3.2).
-Fully offline. No API keys needed.
+Fully offline. No API keys needed.(Also if it says missing dependencies js install them plz)
 
 ---
 
