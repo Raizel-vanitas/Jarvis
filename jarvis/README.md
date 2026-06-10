@@ -19,7 +19,7 @@ Fully offline. No API keys needed.(Also if it says missing dependencies js insta
 
 ## Setup (do this once)
 
-**Step 1 — Install Python 3.11**
+**Step 1 — Install Python 3.14**
 Download from https://www.python.org/downloads/
 > ✅ Tick **"Add Python to PATH"** during install
 
