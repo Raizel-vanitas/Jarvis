@@ -27,7 +27,8 @@ Download from https://www.python.org/downloads/
 Download from https://ollama.com and install it.
 
 **Step 3 — Run the installer**
-Double-click `install.bat`. It will install all Python packages and pull the AI model.
+Double-click `install all.bat`. It will install all Python packages and pull the AI model.
+(if doesnt work i will list dependencies to install below!)
 
 **Step 4 — Start JARVIS**
 Double-click `jarvis_gui.py`, or run:
@@ -40,6 +41,24 @@ Double-click `setup_startup.bat` to make JARVIS launch automatically when you lo
 To remove it later: open Task Manager → Startup apps → disable JARVIS.
 
 ---
+
+# Dependencies
+requests
+psutil
+pyttsx3
+SpeechRecognition
+pyaudio
+edge-tts
+pygame
+sounddevice
+numpy
+pygetwindow
+plyer
+pystray
+pillow
+pyautogui
+pyperclip
+pywin32
 
 ## Daily use
 
