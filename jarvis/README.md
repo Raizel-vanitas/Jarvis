@@ -5,7 +5,7 @@ Fully offline. No API keys needed.(Also if it says missing dependencies js insta
 
 ---
 
-#Models
+# Models
 You can use different AI models for smarter responses, by default llama3.2 is selected. personally i'd recommend qwen2.5-coder:7b which u can edit in the config folder.
 
 
