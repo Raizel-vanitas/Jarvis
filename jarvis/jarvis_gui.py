@@ -1,4 +1,3 @@
-
 import os, sys, json, re, shutil, time, threading, subprocess, webbrowser, math
 import urllib.parse, html, queue
 import tkinter as tk
@@ -633,9 +632,12 @@ AVAILABLE JSON ACTIONS:
 
 def ask_ai(user_message: str) -> str:
     chat_history.append({"role": "user", "content": user_message})
+    messages = [{"role": "system", "content": build_system_prompt()}] + chat_history[-20:]
+
+    # ── Local Ollama ────────────────────────────────────────────────
     payload = {
         "model":    CFG.get("model", "llama3.2"),
-        "messages": [{"role": "system", "content": build_system_prompt()}] + chat_history[-20:],
+        "messages": messages,
         "stream":   False,
     }
     try:
@@ -958,7 +960,7 @@ def open_app(name: str) -> str:
         "nordvpn":               "NordVPN.exe",
         "expressvpn":            "expressvpn.exe",
         "everything":            "Everything.exe",
-        "autohotkey":            "AutoHotkey.exe",
+        "autohotkey":            "Autohotkey.exe",
         "treesizefree":          "TreeSizeFree.exe",
         "bitwarden":             "Bitwarden.exe",
         "1password":             "1Password.exe",
@@ -1616,33 +1618,120 @@ def git_run(git_cmd: str, path: str = "") -> str:
 
 
 
-def web_search_read(query: str, num_results: int = 5) -> str:
-    """Fetch actual text snippets from DuckDuckGo HTML results."""
+def web_search_read(query: str, num_results: int = 4) -> str:
+    """
+    Search DuckDuckGo, then scrape the top result pages for real content.
+    Falls back gracefully if BeautifulSoup isn't installed.
+    """
+    HEADERS = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0 Safari/537.36"
+        )
+    }
+
+    # ── Step 1: get result URLs from DuckDuckGo ──────────────────────────────
     try:
-        url = f"https://html.duckduckgo.com/html/?q={urllib.parse.quote_plus(query)}"
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-        resp = requests.get(url, headers=headers, timeout=10)
+        ddg_url = f"https://html.duckduckgo.com/html/?q={urllib.parse.quote_plus(query)}"
+        resp = requests.get(ddg_url, headers=HEADERS, timeout=10)
         resp.raise_for_status()
-        # Parse results with simple regex (no bs4 required)
-        titles   = re.findall(r'class="result__a"[^>]*>(.*?)</a>', resp.text, re.DOTALL)
-        snippets = re.findall(r'class="result__snippet"[^>]*>(.*?)</(?:a|span)>', resp.text, re.DOTALL)
-        # Clean HTML tags and entities
-        def clean(s):
+
+        # Extract titles + hrefs from DDG result anchors
+        raw_links = re.findall(
+            r'class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
+            resp.text, re.DOTALL
+        )
+        # DDG wraps real URLs in redirects — unwrap them
+        def _unwrap(href: str) -> str:
+            if href.startswith("//duckduckgo.com/l/?"):
+                m = re.search(r'uddg=([^&]+)', href)
+                if m:
+                    return urllib.parse.unquote(m.group(1))
+            if href.startswith("/"):
+                return "https://duckduckgo.com" + href
+            return href
+
+        def _clean_html(s: str) -> str:
             s = re.sub(r'<[^>]+>', '', s)
             return html.unescape(s).strip()
-        titles   = [clean(t) for t in titles   if clean(t)][:num_results]
-        snippets = [clean(s) for s in snippets if clean(s)][:num_results]
-        if not titles:
-            return f"No results found for: {query}"
-        lines = [f"🔍 Search results for: {query}\n"]
-        for i, (t, s) in enumerate(zip(titles, snippets), 1):
-            lines.append(f"{i}. {t}")
-            lines.append(f"   {s}\n")
-        return "\n".join(lines)
+
+        results = []
+        for href, title_raw in raw_links:
+            url = _unwrap(href)
+            title = _clean_html(title_raw)
+            if url.startswith("http") and title:
+                results.append((url, title))
+            if len(results) >= num_results:
+                break
+
+        if not results:
+            return f"No search results found for: {query}"
+
     except Exception as e:
-        # Fall back to opening in browser
         web_search(query)
-        return f"Could not fetch results directly ({e}). Opened browser instead."
+        return f"Couldn't reach DuckDuckGo ({e}). Opened your browser instead."
+
+    # ── Step 2: scrape each page for readable text ───────────────────────────
+    try:
+        from bs4 import BeautifulSoup
+        _BS4_OK = True
+    except ImportError:
+        _BS4_OK = False
+
+    def _scrape_page(url: str, char_limit: int = 1200) -> str:
+        """Return a plain-text excerpt from a web page."""
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=8, allow_redirects=True)
+            r.raise_for_status()
+            content_type = r.headers.get("Content-Type", "")
+            if "text/html" not in content_type:
+                return "(non-HTML page, skipped)"
+
+            if _BS4_OK:
+                soup = BeautifulSoup(r.text, "html.parser")
+                # Remove noise
+                for tag in soup(["script", "style", "nav", "footer",
+                                  "header", "aside", "form", "noscript"]):
+                    tag.decompose()
+                # Prefer article / main body; fall back to whole body
+                body = (soup.find("article") or
+                        soup.find("main") or
+                        soup.find(id=re.compile(r'(content|article|main)', re.I)) or
+                        soup.body)
+                text = body.get_text(separator=" ", strip=True) if body else ""
+            else:
+                # Regex fallback — strip tags, collapse whitespace
+                text = re.sub(r'<[^>]+>', ' ', r.text)
+                text = html.unescape(text)
+
+            # Collapse whitespace
+            text = re.sub(r'\s+', ' ', text).strip()
+            return text[:char_limit] + ("…" if len(text) > char_limit else "")
+        except Exception as ex:
+            return f"(couldn't read page: {ex})"
+
+    # ── Step 3: build the response ────────────────────────────────────────────
+    lines = [f"🔍 Web results for: \"{query}\"\n"]
+    for i, (url, title) in enumerate(results, 1):
+        if gui_app:
+            gui_app.set_status(f"Scraping result {i}/{len(results)}…")
+        excerpt = _scrape_page(url)
+        lines.append(f"{'─'*60}")
+        lines.append(f"{i}. {title}")
+        lines.append(f"   {url}")
+        lines.append(f"   {excerpt}\n")
+
+    if not _BS4_OK:
+        lines.append(
+            "💡 Tip: install beautifulsoup4 for cleaner scraping: "
+            "pip install beautifulsoup4"
+        )
+
+    if gui_app:
+        gui_app.set_status("Ready")
+
+    return "\n".join(lines)
 
 
 
@@ -2438,6 +2527,55 @@ def run_tray():
 
 
 
+def _list_microphones() -> list[tuple[int, str]]:
+    """
+    Return a list of (device_index, name) tuples for all input devices.
+    Tries PyAudio/speech_recognition first, falls back to sounddevice,
+    then falls back to Windows MMDevice via subprocess.
+    """
+    if _PYAUDIO_OK:
+        try:
+            return list(enumerate(sr.Microphone.list_microphone_names()))
+        except Exception:
+            pass
+
+    if _SOUNDDEVICE_OK:
+        try:
+            import sounddevice as _sd
+            result = []
+            for i, d in enumerate(_sd.query_devices()):
+                try:
+                    ch = d['max_input_channels'] if isinstance(d, dict) else getattr(d, 'max_input_channels', 0)
+                    name = d['name'] if isinstance(d, dict) else getattr(d, 'name', str(d))
+                    if int(ch) > 0:
+                        result.append((i, name))
+                except Exception:
+                    pass
+            if result:
+                return result
+        except Exception:
+            pass
+
+    # Last resort: query Windows audio devices via PowerShell
+    try:
+        import subprocess as _sp
+        ps = (
+            "Get-WmiObject Win32_SoundDevice | "
+            "Select-Object -ExpandProperty Name"
+        )
+        out = _sp.check_output(
+            ["powershell", "-NoProfile", "-Command", ps],
+            timeout=5, text=True, stderr=_sp.DEVNULL
+        )
+        names = [n.strip() for n in out.strip().splitlines() if n.strip()]
+        if names:
+            return list(enumerate(names))
+    except Exception:
+        pass
+
+    return []
+
+
 class SettingsDialog(tk.Toplevel):
     # Colours mirroring the main window
     BG    = "#0d1117"
@@ -2472,15 +2610,48 @@ class SettingsDialog(tk.Toplevel):
         return e
 
     def _build(self):
-        # Header
+        self.resizable(True, True)
+        self.geometry("460x580")
+
+        # Header (fixed, outside scroll)
         header = tk.Frame(self, bg=self.PANEL, height=56)
         header.pack(fill="x")
         tk.Label(header, text="⚙  Settings", bg=self.PANEL, fg=self.ACCENT,
                  font=("Segoe UI", 14, "bold")).pack(side="left", padx=16, pady=12)
 
-        # Form
-        form = tk.Frame(self, bg=self.PANEL)
-        form.pack(fill="both", expand=True, padx=16, pady=12)
+        # ── Scrollable body ───────────────────────────────────────────────────
+        body = tk.Frame(self, bg=self.BG)
+        body.pack(fill="both", expand=True)
+
+        canvas = tk.Canvas(body, bg=self.PANEL, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(body, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        scrollbar.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+
+        # Inner frame that holds all the form widgets
+        form = tk.Frame(canvas, bg=self.PANEL)
+        form_window = canvas.create_window((0, 0), window=form, anchor="nw")
+
+        # Keep the canvas window width in sync with the canvas
+        def _on_canvas_resize(event):
+            canvas.itemconfig(form_window, width=event.width)
+        canvas.bind("<Configure>", _on_canvas_resize)
+
+        # Update scroll region when form grows
+        def _on_form_resize(event):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+        form.bind("<Configure>", _on_form_resize)
+
+        # Mouse-wheel scrolling (Windows & Linux)
+        def _on_mousewheel(event):
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        # Unbind when dialog closes so it doesn't affect the main window
+        self.protocol("WM_DELETE_WINDOW", lambda: (
+            canvas.unbind_all("<MouseWheel>"), self.destroy()))
+
         form.columnconfigure(1, weight=1)
 
         self._label(form, "Your name", 0)
@@ -2503,18 +2674,16 @@ class SettingsDialog(tk.Toplevel):
 
         # Microphone picker
         self._label(form, "Microphone", 6)
-        mics = []
-        try:
-            mics = list(enumerate(sr.Microphone.list_microphone_names()))
-        except Exception:
-            pass
+        mics = _list_microphones()
 
         self.mic_cb = ttk.Combobox(form, state="readonly", width=27,
                                     font=("Segoe UI", 10))
         self.mic_cb["values"] = [f"[{i}] {n}" for i, n in mics] if mics else ["(no mics found)"]
         cur_mic = CFG.get("mic_index")
         if cur_mic is not None and mics:
-            self.mic_cb.current(min(cur_mic, len(mics)-1))
+            # Find the position in the list whose device index matches cur_mic
+            pos = next((pos for pos, (dev_idx, _) in enumerate(mics) if dev_idx == cur_mic), 0)
+            self.mic_cb.current(pos)
         elif mics:
             self.mic_cb.current(0)
         self.mic_cb.grid(row=6, column=1, padx=12, pady=6, sticky="ew")
@@ -2530,9 +2699,13 @@ class SettingsDialog(tk.Toplevel):
                        text="Launch JARVIS at Windows login"
                        ).grid(row=7, column=1, padx=12, pady=6, sticky="w")
 
-        # Buttons
+        # ── Buttons (fixed at bottom, outside scroll) ────────────────────────
+        # We need these packed before `body` so they anchor to the bottom.
+        # Rebuild packing order: destroy & re-pack body after buttons.
+        body.pack_forget()
         btn_frame = tk.Frame(self, bg=self.BG)
-        btn_frame.pack(fill="x", padx=16, pady=12)
+        btn_frame.pack(side="bottom", fill="x", padx=16, pady=12)
+        body.pack(fill="both", expand=True)
 
         tk.Button(btn_frame, text="Save", bg=self.ACCENT, fg="#0d1117",
                   font=("Segoe UI", 10, "bold"), relief="flat", padx=20, pady=8,
@@ -3003,11 +3176,7 @@ def gui_setup_wizard():
         name = os.getlogin().title()
 
     # Mic selection
-    mics = []
-    try:
-        mics = list(enumerate(sr.Microphone.list_microphone_names()))
-    except Exception:
-        pass
+    mics = _list_microphones()
 
     mic_idx = 0
     if mics:
