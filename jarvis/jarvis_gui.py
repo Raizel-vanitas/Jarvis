@@ -458,16 +458,13 @@ def wake_word_loop():
                 # Restore window if hidden to tray or minimised
                 if gui_app:
                     def _restore_gui():
-                        if gui_app.state() == "withdrawn":
-                            gui_app.deiconify()
-                        elif gui_app.state() == "iconic":
-                            gui_app.iconify()   # un-minimise
+                        if gui_app.state() in ("withdrawn", "iconic"):
                             gui_app.deiconify()
                         gui_app.lift()
                         gui_app.focus_force()
                     gui_app.after(0, _restore_gui)
                 if gui_app: gui_app.flash_wake()
-                speak(f"Yes, {owner}?")
+                speak("Sir?")
                 command = listen_for_command("Listening — speak your command…")
                 if command:
                     handle_command(command)
@@ -1479,19 +1476,53 @@ def minimize_window(name: str) -> str:
     try:
         all_wins = [w for w in gw.getAllWindows() if w.title.strip()]
         minimized = []
+        seen_hwnds = set()
+
+        # Pass 1: hint-based substring match (minimizes ALL matching windows)
         for hint in hints:
             for w in all_wins:
                 if hint in w.title.lower():
+                    hwnd = getattr(w, "_hWnd", None)
+                    if hwnd and hwnd in seen_hwnds:
+                        continue
+                    if hwnd:
+                        seen_hwnds.add(hwnd)
+                    if _do_minimize(w):
+                        minimized.append(w.title)
+
+        if minimized:
+            label = minimized[0] if len(minimized) == 1 else f"{len(minimized)} windows"
+            return f"Minimised: {label}."
+
+        # Pass 2: fuzzy title fallback
+        all_titles_lower = [w.title.lower() for w in all_wins]
+        close = _dl.get_close_matches(name_lower, all_titles_lower, n=3, cutoff=0.50)
+        for match_title in close:
+            for w in all_wins:
+                if w.title.lower() == match_title:
+                    hwnd = getattr(w, "_hWnd", None)
+                    if hwnd and hwnd in seen_hwnds:
+                        continue
+                    if hwnd:
+                        seen_hwnds.add(hwnd)
                     if _do_minimize(w):
                         minimized.append(w.title)
         if minimized:
             return f"Minimised: {minimized[0]}."
-        # Fuzzy fallback
-        close = _dl.get_close_matches(name_lower, [w.title.lower() for w in all_wins], n=1, cutoff=0.55)
-        if close:
-            w = next(x for x in all_wins if x.title.lower() == close[0])
-            if _do_minimize(w):
-                return f"Minimised: {w.title}."
+
+        # Pass 3: partial-word containment fallback
+        words = name_lower.split()
+        for w in all_wins:
+            tl = w.title.lower()
+            if any(word in tl for word in words if len(word) > 3):
+                hwnd = getattr(w, "_hWnd", None)
+                if hwnd and hwnd in seen_hwnds:
+                    continue
+                if hwnd:
+                    seen_hwnds.add(hwnd)
+                if _do_minimize(w):
+                    return f"Minimised: {w.title}."
+
     except Exception as e:
         return f"Couldn't minimise '{name}': {e}"
 
@@ -2476,21 +2507,98 @@ def background_monitor():
 
 
 
-def make_tray_image() -> Image.Image:
-    """Draw a glowing arc-reactor style tray icon."""
-    size = 64
+def make_geass_icon(size: int = 64) -> Image.Image:
+    """
+    Draw a Code Geass-inspired Geass sigil icon.
+    Stylised eye with a star/spoke crown motif in crimson and gold on dark.
+    """
     img  = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
-    # Outer glow ring
-    draw.ellipse([2, 2, 62, 62], fill=(0, 30, 50, 200))
-    draw.ellipse([4, 4, 60, 60], outline=(0, 180, 216), width=3)
-    # Inner ring
-    draw.ellipse([16, 16, 48, 48], outline=(0, 119, 182), width=2)
-    # Core
-    draw.ellipse([25, 25, 39, 39], fill=(0, 180, 216))
-    # "J" text
-    draw.text((23, 20), "J", fill=(5, 10, 15))
+    cx, cy = size // 2, size // 2
+    r = size // 2 - 2
+
+    # Dark background circle
+    draw.ellipse([cx - r, cy - r, cx + r, cy + r],
+                 fill=(10, 0, 5, 230), outline=(180, 0, 30), width=max(1, size // 32))
+
+    # Outer ring (gold)
+    ro = int(r * 0.88)
+    draw.ellipse([cx - ro, cy - ro, cx + ro, cy + ro],
+                 outline=(200, 160, 20), width=max(1, size // 22))
+
+    # Inner iris ring (crimson)
+    ri = int(r * 0.55)
+    draw.ellipse([cx - ri, cy - ri, cx + ri, cy + ri],
+                 outline=(220, 20, 40), width=max(1, size // 28))
+
+    # Pupil (glowing red-white core)
+    rp = int(r * 0.22)
+    draw.ellipse([cx - rp, cy - rp, cx + rp, cy + rp],
+                 fill=(240, 30, 50), outline=(255, 180, 180), width=max(1, size // 40))
+
+    # Six-pointed star spokes (Geass star motif)
+    # Alternating long (even) and short (odd) spokes
+    spoke_outer = int(r * 0.83)
+    spoke_inner = int(r * 0.55)
+    spoke_w     = max(1, size // 40)
+    for i in range(6):
+        angle_rad = math.radians(i * 60 - 90)
+        outer_r = spoke_outer if i % 2 == 0 else spoke_inner
+        x1 = cx + int(spoke_inner * math.cos(angle_rad))
+        y1 = cy + int(spoke_inner * math.sin(angle_rad))
+        x2 = cx + int(outer_r    * math.cos(angle_rad))
+        y2 = cy + int(outer_r    * math.sin(angle_rad))
+        colour = (200, 160, 20) if i % 2 == 0 else (220, 20, 40)
+        draw.line([x1, y1, x2, y2], fill=colour, width=spoke_w)
+
+    # Diamond tips on the 3 long spokes
+    tip_r = max(1, size // 20)
+    for i in range(0, 6, 2):
+        angle_rad = math.radians(i * 60 - 90)
+        tx = cx + int(spoke_outer * math.cos(angle_rad))
+        ty = cy + int(spoke_outer * math.sin(angle_rad))
+        draw.ellipse([tx - tip_r, ty - tip_r, tx + tip_r, ty + tip_r],
+                     fill=(220, 180, 30))
+
+    # Wing arcs sweeping left and right
+    wing_r = int(r * 0.70)
+    wing_w = max(1, size // 28)
+    draw.arc([cx - wing_r - int(r*0.25), cy - wing_r,
+              cx - int(r*0.25),           cy + wing_r],
+             start=200, end=340, fill=(220, 20, 40), width=wing_w)
+    draw.arc([cx + int(r*0.25),           cy - wing_r,
+              cx + wing_r + int(r*0.25),  cy + wing_r],
+             start=200, end=340, fill=(220, 20, 40), width=wing_w)
+
     return img
+
+
+def _set_window_icon(root: tk.Tk):
+    """Set the taskbar / title-bar icon to the Geass sigil."""
+    try:
+        import io, tempfile, os as _os
+        icon_img = make_geass_icon(64)
+        buf = io.BytesIO()
+        icon_img.save(buf, format="ICO", sizes=[(64, 64), (32, 32), (16, 16)])
+        buf.seek(0)
+        tmp = tempfile.NamedTemporaryFile(suffix=".ico", delete=False)
+        tmp.write(buf.read())
+        tmp.close()
+        root.iconbitmap(tmp.name)
+        root.after(4000, lambda: _os.unlink(tmp.name) if _os.path.exists(tmp.name) else None)
+    except Exception:
+        try:
+            icon_img = make_geass_icon(32)
+            photo = ImageTk.PhotoImage(icon_img)
+            root.iconphoto(True, photo)
+            root._geass_icon_ref = photo
+        except Exception:
+            pass
+
+
+def make_tray_image() -> Image.Image:
+    """Return the Geass sigil as the system tray icon."""
+    return make_geass_icon(64)
 
 
 def show_jarvis_tray(icon, item):
@@ -2919,6 +3027,8 @@ class JarvisApp(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._tick_clock()
         self._animate_arc()
+        # Apply Geass sigil as window/taskbar icon
+        self.after(100, lambda: _set_window_icon(self))
 
     # ── UI construction ──────────────────────
     def _build_ui(self):
@@ -3157,9 +3267,7 @@ class JarvisApp(tk.Tk):
         )
 
 
-# ─────────────────────────────────────────────
-#  SETUP WIZARD (GUI)
-# ─────────────────────────────────────────────
+
 def gui_setup_wizard():
     """Simple GUI first-run setup using standard dialogs."""
     root = tk.Tk()
@@ -3270,9 +3378,7 @@ def is_startup_registered() -> bool:
         return False
 
 
-# ─────────────────────────────────────────────
-#  MAIN
-# ─────────────────────────────────────────────
+
 def main():
     global CFG, HOME_DIR, gui_app
 
