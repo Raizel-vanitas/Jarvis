@@ -289,8 +289,8 @@ def listen_for_command(prompt_text: str | None = None) -> str | None:
             if gui_app: gui_app.set_status("🎤 Listening… (speak now)")
             audio = _capture_audio_sounddevice()
         else:
-            if mic_index is None:
-                return None
+            # FIX: Removed the check that prevented listening if mic_index was None.
+            # sr.Microphone() defaults to the system default microphone if device_index is None.
             with sr.Microphone(device_index=mic_index) as source:
                 recognizer.adjust_for_ambient_noise(source, duration=0.5)
                 audio = recognizer.listen(source, timeout=8, phrase_time_limit=15)
@@ -444,9 +444,9 @@ def wake_word_loop():
                     _sd.default.device = mic_index
                 audio = _capture_audio_sounddevice(duration=3)
             else:
-                if mic_index is None:
-                    time.sleep(1)
-                    continue
+                # FIX: Removed the check that blocked listening if mic_index was None.
+                # We now pass mic_index (which might be None) directly to sr.Microphone.
+                # device_index=None uses the OS default microphone.
                 with sr.Microphone(device_index=mic_index) as source:
                     recognizer.adjust_for_ambient_noise(source, duration=0.3)
                     audio = recognizer.listen(source, timeout=3, phrase_time_limit=4)
@@ -963,6 +963,7 @@ def open_app(name: str) -> str:
         "autohotkey":            "Autohotkey.exe",
         "treesizefree":          "TreeSizeFree.exe",
         "bitwarden":             "Bitwarden.exe",
+                "bitwarden":             "Bitwarden.exe",
         "1password":             "1Password.exe",
         "notion":                "Notion.exe",
         "obsidian":              "Obsidian.exe",
