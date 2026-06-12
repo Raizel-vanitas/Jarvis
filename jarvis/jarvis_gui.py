@@ -1,4 +1,10 @@
+
+from playsound import playsound
 import os, sys, json, re, shutil, time, threading, subprocess, webbrowser, math
+from jarvis_learning import (
+    lookup_learned, teach_jarvis, forget_trigger,
+    list_learned, interactive_teach, increment_hits,
+)
 import urllib.parse, html, queue
 import tkinter as tk
 from tkinter import ttk, scrolledtext, simpledialog, messagebox
@@ -112,10 +118,11 @@ listening    = True
 running      = True
 gui_app      = None   # reference to the main GUI window
 
-
+# ── TTS queue: all audio is serialised through a single background thread ──
+_tts_queue: queue.Queue = queue.Queue()
 
 _JARVIS_VOICE   = "en-GB-RyanNeural"  
-_JARVIS_RATE    = "-5%"                 
+_JARVIS_RATE    = "-3%"                 
 _JARVIS_PITCH   = "-8Hz"               
 
 def init_tts():
@@ -139,8 +146,7 @@ def init_tts():
         tts_engine = None
 
 
-def _speak_edge(text: str):
-    """Speak using Microsoft Edge neural TTS (en-GB-RyanNeural)."""
+def _speak_edge_sync(text: str):
     async def _run():
         communicator = edge_tts.Communicate(
             text,
@@ -153,61 +159,82 @@ def _speak_edge(text: str):
         await communicator.save(tmp_path)
         return tmp_path
 
+    tmp_path = None
     try:
-        tmp_path = asyncio.run(_run())
-        if _PYGAME_OK:
-            pygame.mixer.music.load(tmp_path)
-            pygame.mixer.music.play()
-            while pygame.mixer.music.get_busy():
-                import time; time.sleep(0.05)
-            pygame.mixer.music.unload()
-        else:
-            
-            import subprocess as _sp
-            _sp.run(["powershell", "-c", f'(New-Object Media.SoundPlayer "{tmp_path}").PlaySync()'],
-                    capture_output=True)
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            tmp_path = loop.run_until_complete(_run())
+        finally:
+            loop.close()
+
+        playsound(tmp_path)
+
     except Exception as e:
         print(f"[edge-tts] {e}")
     finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+
+
+def _tts_worker():
+    while True:
+        text = _tts_queue.get()
+        if text is None:
+            break
         try:
-            import os as _os; _os.unlink(tmp_path)
-        except Exception:
-            pass
+            if _EDGE_TTS_OK:
+                _speak_edge_sync(text)
+            elif tts_engine:
+                try:
+                    tts_engine.say(text)
+                    tts_engine.runAndWait()
+                except Exception:
+                    pass
+        except Exception as e:
+            print(f"[tts_worker] {e}")
+        finally:
+            _tts_queue.task_done()
+
+# Start the TTS worker once at import time (restarts if it ever crashes)
+_tts_thread = threading.Thread(target=_tts_worker, daemon=True, name="tts-worker")
+
+# Start the TTS worker once at import time (restarts if it ever crashes)
+_tts_thread = threading.Thread(target=_tts_worker, daemon=True, name="tts-worker")
+_tts_thread.start()
 
 
 def speak(text: str):
+    """
+    Non-blocking speak: strips markdown, updates the GUI immediately,
+    then queues audio for the TTS worker thread.
+    """
     clean = re.sub(r'[*_`#]', '', text)
     clean = re.sub(r'\{[^}]*\}', '', clean).strip()
     if not clean:
         return
+    # GUI update is always safe via .after() — never call Tkinter directly from
+    # a non-main thread.
     if gui_app:
-        gui_app.add_message("JARVIS", clean, tag="jarvis")
-    if _EDGE_TTS_OK:
-        _speak_edge(clean)
-    elif tts_engine:
-        try:
-            tts_engine.say(clean)
-            tts_engine.runAndWait()
-        except Exception:
-            pass
+        gui_app.after(0, lambda t=clean: gui_app.add_message("JARVIS", t, tag="jarvis"))
+    _tts_queue.put(clean)
 
 
 def voice_confirm(prompt: str) -> bool:
     """
     Ask the user a yes/no question via voice (and show it in the GUI).
-    Returns True if the user says 'yes', 'yeah', 'yep', 'confirm', 'do it',
-    'affirmative', or 'go ahead'.  Returns False for 'no', 'nope', 'cancel',
-    'abort', 'stop', or on timeout / unrecognised speech.
-    Falls back to True (allow) only if the mic is completely unavailable AND
-    the action is low-risk; for destructive actions the safe default is False.
+    IMPORTANT: must NOT be called from the main/GUI thread as it calls
+    listen_for_command which blocks.  Always call from a daemon command thread.
     """
     speak(prompt + " Say YES to confirm, or NO to cancel.")
     if gui_app:
-        gui_app.set_status("🎤 Awaiting confirmation…")
+        gui_app.after(0, lambda: gui_app.set_status("🎤 Awaiting confirmation…"))
 
     raw = listen_for_command("Say YES or NO…")
     if not raw:
-        # No voice captured — deny by default (safest)
         speak("Nothing heard, sir. I'll leave it.")
         return False
 
@@ -223,7 +250,6 @@ def voice_confirm(prompt: str) -> bool:
         speak("Fair enough. Cancelling.")
         return False
 
-    # Ambiguous — deny
     speak(f"Caught '{raw}' but couldn't work out what you meant. Playing it safe and cancelling.")
     return False
 
@@ -279,18 +305,16 @@ def listen_for_command(prompt_text: str | None = None) -> str | None:
     recognizer = _make_recognizer()
 
     if gui_app and prompt_text:
-        gui_app.set_status(f"🎤 {prompt_text}")
+        gui_app.after(0, lambda: gui_app.set_status(f"🎤 {prompt_text}"))
 
     try:
         if _SOUNDDEVICE_OK:
-            # sounddevice path — no pyaudio needed
             if _sd.default.device[0] is None and mic_index is not None:
                 _sd.default.device = mic_index
-            if gui_app: gui_app.set_status("🎤 Listening… (speak now)")
+            if gui_app:
+                gui_app.after(0, lambda: gui_app.set_status("🎤 Listening… (speak now)"))
             audio = _capture_audio_sounddevice()
         else:
-            # FIX: Removed the check that prevented listening if mic_index was None.
-            # sr.Microphone() defaults to the system default microphone if device_index is None.
             with sr.Microphone(device_index=mic_index) as source:
                 recognizer.adjust_for_ambient_noise(source, duration=0.5)
                 audio = recognizer.listen(source, timeout=8, phrase_time_limit=15)
@@ -299,20 +323,23 @@ def listen_for_command(prompt_text: str | None = None) -> str | None:
         corrected_text, changes = _apply_corrections(raw_text)
 
         if gui_app:
-            gui_app.add_message("You (voice)", raw_text, tag="user")
+            gui_app.after(0, lambda: gui_app.add_message("You (voice)", raw_text, tag="user"))
             if changes:
                 hint = _format_did_you_mean(raw_text, corrected_text, changes)
-                gui_app.add_message("JARVIS", hint, tag="system")
-            gui_app.set_status("Ready")
+                gui_app.after(0, lambda h=hint: gui_app.add_message("JARVIS", h, tag="system"))
+            gui_app.after(0, lambda: gui_app.set_status("Ready"))
         return corrected_text
     except (sr.WaitTimeoutError, sr.UnknownValueError):
-        if gui_app: gui_app.set_status("Ready")
+        if gui_app:
+            gui_app.after(0, lambda: gui_app.set_status("Ready"))
         return None
     except sr.RequestError as e:
-        if gui_app: gui_app.set_status(f"Speech API error: {e}")
+        if gui_app:
+            gui_app.after(0, lambda: gui_app.set_status(f"Speech API error: {e}"))
         return None
     except Exception as e:
-        if gui_app: gui_app.set_status(f"Mic error: {e}")
+        if gui_app:
+            gui_app.after(0, lambda: gui_app.set_status(f"Mic error: {e}"))
         return None
 
 
@@ -359,7 +386,6 @@ _MISHEARING_MAP = {
     "startup":   ["startop", "startip", "stortup"],
     "shutdown":  ["shutdahn", "shutdaan", "shutdwn"],
     "restart":   ["restort", "restaht", "restat"],
-    "clipboard": ["clipbord", "clibboard", "clipbard"],
     "python":    ["pythan", "pithon", "piton"],
     "git":       ["geet", "jit", "gitt"],
     "clone":     ["cloan", "clome", "klon"],
@@ -381,11 +407,6 @@ for _correct, _variants in _MISHEARING_MAP.items():
 
 
 def _apply_corrections(text: str) -> tuple[str, list[tuple[str, str]]]:
-    """
-    Apply accent-aware corrections to a recognised text string.
-    Returns (corrected_text, list_of_(original, corrected)_pairs).
-    Uses both the lookup table and difflib fuzzy matching against known command words.
-    """
     if not text:
         return text, []
 
@@ -397,13 +418,11 @@ def _apply_corrections(text: str) -> tuple[str, list[tuple[str, str]]]:
     for word in words:
         w_lower = word.lower().strip(".,!?")
 
-        # 1. Direct lookup first
         if w_lower in _CORRECTION_LOOKUP:
             replacement = _CORRECTION_LOOKUP[w_lower]
             corrected_words.append(replacement)
             changes.append((word, replacement))
             continue
-
 
         if w_lower not in _ALL_KNOWN and len(w_lower) >= 4:
             close = _difflib.get_close_matches(w_lower, _ALL_KNOWN, n=1, cutoff=0.82)
@@ -420,7 +439,6 @@ def _apply_corrections(text: str) -> tuple[str, list[tuple[str, str]]]:
 
 
 def _format_did_you_mean(original: str, corrected: str, changes: list[tuple[str, str]]) -> str:
-    """Build a short 'Did you mean X?' spoken/display string."""
     if not changes:
         return ""
     parts = ", ".join(f"'{o}' → '{c}'" for o, c in changes)
@@ -444,18 +462,13 @@ def wake_word_loop():
                     _sd.default.device = mic_index
                 audio = _capture_audio_sounddevice(duration=3)
             else:
-                # FIX: Removed the check that blocked listening if mic_index was None.
-                # We now pass mic_index (which might be None) directly to sr.Microphone.
-                # device_index=None uses the OS default microphone.
                 with sr.Microphone(device_index=mic_index) as source:
                     recognizer.adjust_for_ambient_noise(source, duration=0.3)
                     audio = recognizer.listen(source, timeout=3, phrase_time_limit=4)
 
             text = recognizer.recognize_google(audio).lower()
-            # Apply accent corrections before checking wake word
             corrected, _chg = _apply_corrections(text)
             if wake_word in corrected or wake_word in text:
-                # Restore window if hidden to tray or minimised
                 if gui_app:
                     def _restore_gui():
                         if gui_app.state() in ("withdrawn", "iconic"):
@@ -463,11 +476,17 @@ def wake_word_loop():
                         gui_app.lift()
                         gui_app.focus_force()
                     gui_app.after(0, _restore_gui)
-                if gui_app: gui_app.flash_wake()
+                if gui_app:
+                    gui_app.after(0, gui_app.flash_wake)
                 speak("Sir?")
                 command = listen_for_command("Listening — speak your command…")
                 if command:
-                    handle_command(command)
+                    # Always handle commands in a fresh daemon thread so
+                    # wake_word_loop is free to keep listening immediately
+                    threading.Thread(
+                        target=handle_command, args=(command,), daemon=True,
+                        name="cmd-wake"
+                    ).start()
                 else:
                     speak("Didn't catch that one, sir. Give it another go.")
         except (sr.WaitTimeoutError, sr.UnknownValueError):
@@ -574,7 +593,7 @@ AVAILABLE JSON ACTIONS:
 {{"action": "keyboard_hotkey","keys": ["ctrl", "c"]}}
 {{"action": "switch_tab",     "direction": "next"}}
 {{"action": "switch_window",  "title": "Chrome"}}
-{{"action": "focus_app",      "name": "spotify"}}  // focus open window, or launch if not open
+{{"action": "focus_app",      "name": "spotify"}}
 {{"action": "notify",         "title": "Alert", "message": "text"}}
 {{"action": "pip_install",    "packages": "requests beautifulsoup4"}}
 {{"action": "pip_uninstall",  "packages": "somepackage"}}
@@ -631,7 +650,6 @@ def ask_ai(user_message: str) -> str:
     chat_history.append({"role": "user", "content": user_message})
     messages = [{"role": "system", "content": build_system_prompt()}] + chat_history[-20:]
 
-    # ── Local Ollama ────────────────────────────────────────────────
     payload = {
         "model":    CFG.get("model", "llama3.2"),
         "messages": messages,
@@ -718,7 +736,6 @@ def delete_file(path: str) -> str:
         p = Path(path)
         if not p.exists():
             return f"Not found: {path}"
-        # Voice confirmation
         if gui_app:
             if not voice_confirm(f"Delete {p.name}?"):
                 return "Deletion cancelled."
@@ -822,18 +839,8 @@ def kill_process(name: str) -> str:
 
 
 def open_app(name: str) -> str:
-    """
-    Multi-strategy app launcher:
-      1. Hardcoded known-app map (instant)
-      2. Windows App Paths registry (catches most installed apps)
-      3. Start Menu .lnk shortcuts (catches everything the Start Menu knows)
-      4. Filesystem walk of common install dirs (deep fallback)
-      5. PowerShell Get-Command (last resort)
-    Fuzzy-matches on each strategy so "spotify", "Spotify", "spot" all work.
-    """
     import difflib, winreg
 
-   
     KNOWN = {
         # System tools
         "notepad":               "notepad.exe",
@@ -844,7 +851,7 @@ def open_app(name: str) -> str:
         "taskmgr":               "taskmgr.exe",
         "cmd":                   "cmd.exe",
         "command prompt":        "cmd.exe",
-        "terminal":              "wt.exe",          # Windows Terminal
+        "terminal":              "wt.exe",
         "windows terminal":      "wt.exe",
         "powershell":            "powershell.exe",
         "pwsh":                  "pwsh.exe",
@@ -960,7 +967,6 @@ def open_app(name: str) -> str:
         "autohotkey":            "Autohotkey.exe",
         "treesizefree":          "TreeSizeFree.exe",
         "bitwarden":             "Bitwarden.exe",
-                "bitwarden":             "Bitwarden.exe",
         "1password":             "1Password.exe",
         "notion":                "Notion.exe",
         "obsidian":              "Obsidian.exe",
@@ -972,12 +978,10 @@ def open_app(name: str) -> str:
 
     name_lower = name.strip().lower()
 
-    # ── helper: fuzzy pick from a list ───────────────────────────────────────
     def _best_match(query: str, choices: list[str], cutoff: float = 0.6) -> str | None:
         matches = difflib.get_close_matches(query, choices, n=1, cutoff=cutoff)
         return matches[0] if matches else None
 
-    # ── helper: shell-execute a path/exe/URI ────────────────────────────────
     def _launch(exe: str, label: str) -> str:
         try:
             import win32api, win32con
@@ -987,16 +991,13 @@ def open_app(name: str) -> str:
 
         try:
             if exe.startswith("ms-"):
-                # ms-settings: and similar URI schemes
                 subprocess.Popen(f'start "" "{exe}"', shell=True)
             elif exe.endswith(".msc"):
                 subprocess.Popen(["mmc", exe], shell=False)
             elif _use_win32:
-                # ShellExecute handles .lnk, full paths, bare exe names — all correctly
                 import win32api
                 win32api.ShellExecute(0, "open", exe, None, "", 1)
             else:
-                # Fallback: PowerShell Start-Process (also handles .lnk and full paths)
                 subprocess.Popen(
                     ["powershell", "-WindowStyle", "Hidden", "-Command",
                      f'Start-Process \'{exe}\''],
@@ -1006,9 +1007,7 @@ def open_app(name: str) -> str:
         except Exception as e:
             return f"Found {label} but failed to launch: {e}"
 
-    # ── helper: resolve exe name → full path via App Paths registry ──────────
     def _resolve_exe(exe_name: str) -> str:
-        """Turn 'brave.exe' into its full install path via App Paths registry."""
         for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
             try:
                 key_path = rf"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\{exe_name}"
@@ -1018,21 +1017,17 @@ def open_app(name: str) -> str:
                         return val
             except OSError:
                 pass
-        # Not in registry — return as-is (will work if on PATH)
         return exe_name
 
-    # ── Strategy 1: exact hardcoded match ────────────────────────────────────
     if name_lower in KNOWN:
         exe = _resolve_exe(KNOWN[name_lower])
         return _launch(exe, name)
 
-    # Fuzzy match against known keys
     best = _best_match(name_lower, list(KNOWN.keys()), cutoff=0.72)
     if best:
         exe = _resolve_exe(KNOWN[best])
         return _launch(exe, best)
 
-    # ── Strategy 2: Windows App Paths registry ───────────────────────────────
     APP_PATHS_KEYS = [
         (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths"),
         (winreg.HKEY_CURRENT_USER,  r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths"),
@@ -1065,7 +1060,6 @@ def open_app(name: str) -> str:
     if best:
         return _launch(reg_apps[best], best)
 
-    # ── Strategy 3: Start Menu .lnk shortcuts ────────────────────────────────
     start_menu_dirs = [
         Path(os.environ.get("APPDATA", "")) / "Microsoft" / "Windows" / "Start Menu" / "Programs",
         Path(r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs"),
@@ -1083,7 +1077,6 @@ def open_app(name: str) -> str:
     if best:
         return _launch(str(lnk_map[best]), best)
 
-    # ── Strategy 4: Filesystem walk of install dirs ───────────────────────────
     search_paths = [
         r"C:\Program Files",
         r"C:\Program Files (x86)",
@@ -1096,20 +1089,18 @@ def open_app(name: str) -> str:
         r"D:\Program Files (x86)",
     ]
     search_key = name_lower.replace(" ", "")
-    candidates: list[tuple[int, str]] = []   # (score, full_path)
+    candidates: list[tuple[int, str]] = []
 
     for base in search_paths:
         if not os.path.isdir(base):
             continue
         for root, dirs, files in os.walk(base):
-            # Skip deep noise folders
             dirs[:] = [d for d in dirs if d.lower() not in
                        ("__pycache__", "node_modules", "cache", "temp", "tmp", "logs")]
             for f in files:
                 if not f.lower().endswith(".exe"):
                     continue
                 fl = f.lower().replace(".exe", "").replace(" ", "").replace("-", "").replace("_", "")
-                # Score: exact > starts-with > contains > fuzzy
                 if fl == search_key:
                     candidates.append((0, os.path.join(root, f)))
                 elif fl.startswith(search_key) or search_key.startswith(fl[:max(3, len(fl)-2)]):
@@ -1122,7 +1113,6 @@ def open_app(name: str) -> str:
         _, best_path = candidates[0]
         return _launch(best_path, Path(best_path).stem)
 
-    # ── Strategy 5: PowerShell Get-Command (last resort) ─────────────────────
     try:
         ps_result = subprocess.run(
             ["powershell", "-Command",
@@ -1192,7 +1182,6 @@ def web_search(query: str) -> str:
 
 
 def open_link(url: str) -> str:
-    """Open a URL in the default browser."""
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
     try:
@@ -1256,16 +1245,15 @@ def keyboard_type(text: str) -> str:
 def keyboard_hotkey(*keys: str) -> str:
     if not PYAUTOGUI_OK:
         return "pyautogui not installed."
-    # Security: only allow safe hotkeys
     ALLOWED_HOTKEYS = {
         ("ctrl", "c"), ("ctrl", "v"), ("ctrl", "z"), ("ctrl", "y"),
         ("ctrl", "a"), ("ctrl", "s"), ("ctrl", "w"), ("ctrl", "t"),
         ("ctrl", "tab"), ("ctrl", "shift", "tab"),
         ("alt", "tab"), ("alt", "f4"),
-        ("ctrl", "l"),   # browser address bar
+        ("ctrl", "l"),
         ("f5",), ("f11",),
-        ("win", "d"),    # show desktop
-        ("win", "e"),    # file explorer
+        ("win", "d"),
+        ("win", "e"),
     }
     key_tuple = tuple(k.lower() for k in keys)
     if key_tuple not in ALLOWED_HOTKEYS:
@@ -1279,7 +1267,6 @@ def keyboard_hotkey(*keys: str) -> str:
 
 
 def switch_tab(direction: str = "next") -> str:
-    """Switch browser/app tabs using Ctrl+Tab or Ctrl+Shift+Tab."""
     if not PYAUTOGUI_OK:
         return "pyautogui not installed."
     try:
@@ -1294,7 +1281,6 @@ def switch_tab(direction: str = "next") -> str:
 
 
 def switch_window(title_fragment: str) -> str:
-    """Focus a window whose title contains the given fragment."""
     try:
         wins = [w for w in gw.getAllWindows() if title_fragment.lower() in w.title.lower() and w.title.strip()]
         if not wins:
@@ -1306,15 +1292,9 @@ def switch_window(title_fragment: str) -> str:
 
 
 def _restore_and_focus(w) -> bool:
-    """
-    Restore a window from minimized state and bring it to the foreground.
-    Tries win32gui first (most reliable on Windows), falls back to pygetwindow.
-    Returns True if successful.
-    """
     try:
         import win32gui, win32con
         hwnd = w._hWnd
-        # SW_RESTORE = 9 — restores minimized OR maximized to normal; no-op if already normal
         win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
         win32gui.SetForegroundWindow(hwnd)
         return True
@@ -1330,14 +1310,8 @@ def _restore_and_focus(w) -> bool:
 
 
 def focus_or_open_app(name: str) -> str:
-    """
-    Restore + focus an already-open window whose title matches 'name'.
-    If nothing is open, fall back to open_app() to launch it.
-    Handles common app name -> window title mappings.
-    """
     import difflib as _dl
 
-    # Map spoken names to fragments we expect in window titles
     TITLE_HINTS = {
         "chrome":        ["chrome", "google chrome"],
         "firefox":       ["firefox", "mozilla firefox"],
@@ -1386,13 +1360,11 @@ def focus_or_open_app(name: str) -> str:
 
     try:
         all_wins = [w for w in gw.getAllWindows() if w.title.strip()]
-        # Try each hint against open window titles
         for hint in hints:
             for w in all_wins:
                 if hint in w.title.lower():
                     if _restore_and_focus(w):
                         return f"Switched to {w.title}."
-        # Fuzzy fallback: compare name against all window titles
         titles = [w.title for w in all_wins]
         close = _dl.get_close_matches(name_lower, [t.lower() for t in titles], n=1, cutoff=0.55)
         if close:
@@ -1402,15 +1374,10 @@ def focus_or_open_app(name: str) -> str:
     except Exception:
         pass
 
-    # Nothing open — launch it instead
     return open_app(name)
 
 
 def minimize_window(name: str) -> str:
-    """
-    Minimize a window by app name / title fragment.
-    Uses win32gui.ShowWindow(SW_MINIMIZE) for reliability, with pygetwindow fallback.
-    """
     import difflib as _dl
 
     TITLE_HINTS = {
@@ -1478,7 +1445,6 @@ def minimize_window(name: str) -> str:
         minimized = []
         seen_hwnds = set()
 
-        # Pass 1: hint-based substring match (minimizes ALL matching windows)
         for hint in hints:
             for w in all_wins:
                 if hint in w.title.lower():
@@ -1494,7 +1460,6 @@ def minimize_window(name: str) -> str:
             label = minimized[0] if len(minimized) == 1 else f"{len(minimized)} windows"
             return f"Minimised: {label}."
 
-        # Pass 2: fuzzy title fallback
         all_titles_lower = [w.title.lower() for w in all_wins]
         close = _dl.get_close_matches(name_lower, all_titles_lower, n=3, cutoff=0.50)
         for match_title in close:
@@ -1510,7 +1475,6 @@ def minimize_window(name: str) -> str:
         if minimized:
             return f"Minimised: {minimized[0]}."
 
-        # Pass 3: partial-word containment fallback
         words = name_lower.split()
         for w in all_wins:
             tl = w.title.lower()
@@ -1536,7 +1500,6 @@ SAFE_COMMANDS = {
 }
 
 def _is_safe_command(cmd: str) -> bool:
-    """Allow only commands whose first token is in the safe allowlist."""
     first = cmd.strip().split()[0].lower().rstrip(".exe") if cmd.strip() else ""
     return first in SAFE_COMMANDS
 
@@ -1570,9 +1533,8 @@ def desktop_notify(title: str, message: str):
 
 
 def _stream_subprocess(cmd: str, label: str) -> str:
-    """Run a shell command, stream stdout/stderr line-by-line to chat, return summary."""
     if gui_app:
-        gui_app.add_message("JARVIS", f"Running: {label}", tag="system")
+        gui_app.after(0, lambda l=label: gui_app.add_message("JARVIS", f"Running: {l}", tag="system"))
     try:
         proc = subprocess.Popen(
             cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -1584,7 +1546,7 @@ def _stream_subprocess(cmd: str, label: str) -> str:
             if line:
                 lines.append(line)
                 if gui_app:
-                    gui_app.add_message("»", line, tag="system")
+                    gui_app.after(0, lambda l=line: gui_app.add_message("»", l, tag="system"))
         proc.wait()
         status = "✅ Done." if proc.returncode == 0 else f"⚠️ Exited with code {proc.returncode}."
         return f"{status}\n" + "\n".join(lines[-5:]) if lines else status
@@ -1595,7 +1557,6 @@ def _stream_subprocess(cmd: str, label: str) -> str:
 def pip_install(packages: str) -> str:
     if not packages.strip():
         return "No packages specified."
-    # Safety: reject anything that looks like a shell injection
     if any(c in packages for c in (";", "&", "|", ">", "<", "`", "$", "\n")):
         return "Security policy: suspicious characters in package name."
     if gui_app:
@@ -1635,7 +1596,6 @@ def git_clone(url: str, dest: str = "") -> str:
 
 
 def git_run(git_cmd: str, path: str = "") -> str:
-    """Run a whitelisted git command inside a repo path."""
     subcmd = git_cmd.strip().split()[0].lower() if git_cmd.strip() else ""
     if subcmd not in _GIT_SAFE_CMDS:
         return (f"Security policy: 'git {subcmd}' is not allowed. "
@@ -1652,103 +1612,208 @@ def git_run(git_cmd: str, path: str = "") -> str:
 
 def web_search_read(query: str, num_results: int = 4) -> str:
     """
-    Search DuckDuckGo, then scrape the top result pages for real content.
-    Falls back gracefully if BeautifulSoup isn't installed.
+    Search the web and return a readable summary of the top results.
+    Strategy:
+      1. DuckDuckGo Instant Answer API  (JSON, no scraping, very reliable)
+      2. DuckDuckGo HTML fallback        (parse the HTML page robustly)
+      3. Open browser as last resort
     """
     HEADERS = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/124.0 Safari/537.36"
-        )
+        ),
+        "Accept-Language": "en-GB,en;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     }
 
-    # ── Step 1: get result URLs from DuckDuckGo ──────────────────────────────
-    try:
-        ddg_url = f"https://html.duckduckgo.com/html/?q={urllib.parse.quote_plus(query)}"
-        resp = requests.get(ddg_url, headers=HEADERS, timeout=10)
-        resp.raise_for_status()
-
-        # Extract titles + hrefs from DDG result anchors
-        raw_links = re.findall(
-            r'class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
-            resp.text, re.DOTALL
-        )
-        # DDG wraps real URLs in redirects — unwrap them
-        def _unwrap(href: str) -> str:
-            if href.startswith("//duckduckgo.com/l/?"):
-                m = re.search(r'uddg=([^&]+)', href)
-                if m:
-                    return urllib.parse.unquote(m.group(1))
-            if href.startswith("/"):
-                return "https://duckduckgo.com" + href
-            return href
-
-        def _clean_html(s: str) -> str:
-            s = re.sub(r'<[^>]+>', '', s)
-            return html.unescape(s).strip()
-
-        results = []
-        for href, title_raw in raw_links:
-            url = _unwrap(href)
-            title = _clean_html(title_raw)
-            if url.startswith("http") and title:
-                results.append((url, title))
-            if len(results) >= num_results:
-                break
-
-        if not results:
-            return f"No search results found for: {query}"
-
-    except Exception as e:
-        web_search(query)
-        return f"Couldn't reach DuckDuckGo ({e}). Opened your browser instead."
-
-    # ── Step 2: scrape each page for readable text ───────────────────────────
     try:
         from bs4 import BeautifulSoup
         _BS4_OK = True
     except ImportError:
         _BS4_OK = False
 
-    def _scrape_page(url: str, char_limit: int = 1200) -> str:
-        """Return a plain-text excerpt from a web page."""
-        try:
-            r = requests.get(url, headers=HEADERS, timeout=8, allow_redirects=True)
-            r.raise_for_status()
-            content_type = r.headers.get("Content-Type", "")
-            if "text/html" not in content_type:
-                return "(non-HTML page, skipped)"
+    # ── helpers ──────────────────────────────────────────────────────────────
 
+    def _clean_html(s: str) -> str:
+        s = re.sub(r'<[^>]+>', ' ', s)
+        return html.unescape(s).strip()
+
+    def _scrape_page(url: str, char_limit: int = 1400) -> str:
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=9, allow_redirects=True)
+            r.raise_for_status()
+            ct = r.headers.get("Content-Type", "")
+            if "text/html" not in ct:
+                return "(non-HTML page, skipped)"
             if _BS4_OK:
                 soup = BeautifulSoup(r.text, "html.parser")
-                # Remove noise
                 for tag in soup(["script", "style", "nav", "footer",
-                                  "header", "aside", "form", "noscript"]):
+                                  "header", "aside", "form", "noscript",
+                                  "figure", "figcaption", "iframe"]):
                     tag.decompose()
-                # Prefer article / main body; fall back to whole body
-                body = (soup.find("article") or
-                        soup.find("main") or
-                        soup.find(id=re.compile(r'(content|article|main)', re.I)) or
-                        soup.body)
-                text = body.get_text(separator=" ", strip=True) if body else ""
+                body = (
+                    soup.find("article") or
+                    soup.find("main") or
+                    soup.find(attrs={"id": re.compile(r"(content|article|main|body)", re.I)}) or
+                    soup.find(attrs={"class": re.compile(r"(article|content|post|entry)", re.I)}) or
+                    soup.body
+                )
+                text = body.get_text(separator=" ", strip=True) if body else r.text
             else:
-                # Regex fallback — strip tags, collapse whitespace
-                text = re.sub(r'<[^>]+>', ' ', r.text)
-                text = html.unescape(text)
-
-            # Collapse whitespace
+                text = _clean_html(r.text)
             text = re.sub(r'\s+', ' ', text).strip()
             return text[:char_limit] + ("…" if len(text) > char_limit else "")
         except Exception as ex:
-            return f"(couldn't read page: {ex})"
+            return f"(couldn't read: {ex})"
 
-    # ── Step 3: build the response ────────────────────────────────────────────
+    # ── Strategy 1: DuckDuckGo Instant Answer / Zero-click API ───────────────
+    results = []   # list of (url, title, snippet)
+
+    try:
+        api_url = (
+            "https://api.duckduckgo.com/?q="
+            + urllib.parse.quote_plus(query)
+            + "&format=json&no_redirect=1&no_html=1&skip_disambig=1"
+        )
+        api_resp = requests.get(api_url, headers=HEADERS, timeout=8)
+        api_resp.raise_for_status()
+        data = api_resp.json()
+
+        # Instant answer (AbstractText)
+        if data.get("AbstractText") and data.get("AbstractURL"):
+            results.append((
+                data["AbstractURL"],
+                data.get("Heading", query),
+                data["AbstractText"][:1400],
+            ))
+
+        # Related topics
+        for topic in data.get("RelatedTopics", []):
+            if len(results) >= num_results:
+                break
+            if isinstance(topic, dict) and topic.get("FirstURL") and topic.get("Text"):
+                results.append((
+                    topic["FirstURL"],
+                    topic["Text"][:80],
+                    topic["Text"][:1400],
+                ))
+            # Sometimes RelatedTopics contains sub-groups
+            elif isinstance(topic, dict) and "Topics" in topic:
+                for sub in topic["Topics"]:
+                    if len(results) >= num_results:
+                        break
+                    if sub.get("FirstURL") and sub.get("Text"):
+                        results.append((
+                            sub["FirstURL"],
+                            sub["Text"][:80],
+                            sub["Text"][:1400],
+                        ))
+    except Exception:
+        pass  # fall through to HTML strategy
+
+    # ── Strategy 2: DuckDuckGo HTML page (robust multi-pattern parsing) ──────
+    if len(results) < num_results:
+        try:
+            ddg_url = (
+                "https://html.duckduckgo.com/html/?q="
+                + urllib.parse.quote_plus(query)
+            )
+            resp = requests.get(ddg_url, headers=HEADERS, timeout=12)
+            resp.raise_for_status()
+            page = resp.text
+
+            found_urls: list[tuple[str, str, str]] = []
+
+            if _BS4_OK:
+                soup = BeautifulSoup(page, "html.parser")
+
+                # Modern DDG HTML layout — result links sit in <a class="result__a">
+                # but the href is a DDG redirect; real URL is in uddg= param.
+                # We also try data-href and plain href as fallbacks.
+                for a_tag in soup.find_all("a", class_=re.compile(r"result__a|result-link")):
+                    href = a_tag.get("href", "")
+                    title = a_tag.get_text(strip=True)
+
+                    # Unwrap DDG redirect URLs
+                    if "duckduckgo.com/l/" in href or href.startswith("//duckduckgo.com"):
+                        m = re.search(r'uddg=([^&]+)', href)
+                        if m:
+                            href = urllib.parse.unquote(m.group(1))
+                        else:
+                            continue
+                    if not href.startswith("http"):
+                        continue
+
+                    # Grab the snippet text from the sibling .result__snippet
+                    snippet = ""
+                    parent = a_tag.find_parent(class_=re.compile(r"result"))
+                    if parent:
+                        snip_el = parent.find(class_=re.compile(r"result__snippet|result-snippet"))
+                        if snip_el:
+                            snippet = snip_el.get_text(separator=" ", strip=True)[:800]
+
+                    if title and href not in [r[0] for r in found_urls]:
+                        found_urls.append((href, title, snippet))
+                    if len(found_urls) >= num_results * 2:
+                        break
+            else:
+                # Pure-regex fallback (no bs4) — tries several known DDG patterns
+                patterns = [
+                    # Pattern A: uddg= redirect (classic DDG HTML)
+                    r'uddg=([^&"]+)[^>]*?>[^<]*<[^>]+>([^<]{3,120})</a',
+                    # Pattern B: data-href on result link
+                    r'data-href="(https?://[^"]{10,300})"[^>]*>\s*<[^>]+>([^<]{3,120})</a',
+                    # Pattern C: plain href to external site
+                    r'href="(https?://(?!duckduckgo)[^"]{10,300})"[^>]*class="[^"]*result[^"]*"[^>]*>([^<]{3,120})</a',
+                ]
+                for pat in patterns:
+                    for m in re.finditer(pat, page, re.DOTALL):
+                        raw_href = urllib.parse.unquote(m.group(1))
+                        raw_title = _clean_html(m.group(2))
+                        if raw_href.startswith("http") and raw_title:
+                            if raw_href not in [r[0] for r in found_urls]:
+                                found_urls.append((raw_href, raw_title, ""))
+                        if len(found_urls) >= num_results * 2:
+                            break
+                    if len(found_urls) >= num_results:
+                        break
+
+            # Merge into results, skipping duplicates
+            existing_urls = {r[0] for r in results}
+            for url, title, snippet in found_urls:
+                if url not in existing_urls:
+                    results.append((url, title, snippet))
+                    existing_urls.add(url)
+                if len(results) >= num_results:
+                    break
+
+        except Exception as e:
+            if not results:
+                web_search(query)
+                return f"Search unavailable right now ({e}). Opened your browser instead."
+
+    # ── Nothing at all? Fall back to browser ─────────────────────────────────
+    if not results:
+        web_search(query)
+        return "Couldn't pull results right now. Opened the search in your browser."
+
+    # ── Scrape pages that have no snippet yet ────────────────────────────────
     lines = [f"🔍 Web results for: \"{query}\"\n"]
-    for i, (url, title) in enumerate(results, 1):
+    for i, item in enumerate(results[:num_results], 1):
+        url, title, snippet = item
         if gui_app:
-            gui_app.set_status(f"Scraping result {i}/{len(results)}…")
-        excerpt = _scrape_page(url)
+            gui_app.after(0, lambda i=i, n=min(len(results), num_results):
+                          gui_app.set_status(f"Reading result {i}/{n}…"))
+
+        # Use existing snippet if it's meaty enough, otherwise scrape
+        if len(snippet) < 200:
+            scraped = _scrape_page(url)
+            excerpt = scraped if not scraped.startswith("(couldn't") else (snippet or scraped)
+        else:
+            excerpt = snippet
+
         lines.append(f"{'─'*60}")
         lines.append(f"{i}. {title}")
         lines.append(f"   {url}")
@@ -1756,12 +1821,12 @@ def web_search_read(query: str, num_results: int = 4) -> str:
 
     if not _BS4_OK:
         lines.append(
-            "💡 Tip: install beautifulsoup4 for cleaner scraping: "
+            "💡 Tip: install beautifulsoup4 for richer scraping — "
             "pip install beautifulsoup4"
         )
 
     if gui_app:
-        gui_app.set_status("Ready")
+        gui_app.after(0, lambda: gui_app.set_status("Ready"))
 
     return "\n".join(lines)
 
@@ -1873,7 +1938,6 @@ def delete_note(note_id: int) -> str:
 
 
 def ping_host(host: str) -> str:
-    """Ping a host and return latency info."""
     try:
         param = "-n" if sys.platform == "win32" else "-c"
         cmd = f"ping {param} 4 {host}"
@@ -1881,7 +1945,6 @@ def ping_host(host: str) -> str:
         output = (result.stdout + result.stderr).strip()
         if not output:
             return f"No response from {host}."
-        # Extract average/min/max if present
         lines = output.splitlines()
         summary = next((l for l in reversed(lines) if l.strip()), output[:300])
         return f"🌐 Ping {host}:\n{summary}"
@@ -1892,7 +1955,6 @@ def ping_host(host: str) -> str:
 
 
 def network_status() -> str:
-    """Show network interfaces and connectivity."""
     try:
         lines = ["🌐 Network Status:"]
         addrs = psutil.net_if_addrs()
@@ -1906,7 +1968,6 @@ def network_status() -> str:
                     if a.address and not a.address.startswith("127.") and a.address != "::1":
                         speed = f"{st.speed}Mbps" if st and st.speed else "?"
                         lines.append(f"  {iface}: {a.address}  ({speed})")
-        # Quick internet check
         try:
             requests.get("https://1.1.1.1", timeout=3)
             lines.append("  ✅ Internet: reachable")
@@ -1919,7 +1980,6 @@ def network_status() -> str:
 
 
 def recent_files(directory: str = "", count: int = 10) -> str:
-    """List the most recently modified files in a directory."""
     try:
         base = Path(directory) if directory else HOME_DIR
         if not base.exists():
@@ -1946,7 +2006,6 @@ def recent_files(directory: str = "", count: int = 10) -> str:
 
 
 def folder_sizes(path: str = "", top_n: int = 10) -> str:
-    """Show the largest immediate sub-folders in a directory."""
     try:
         base = Path(path) if path else HOME_DIR
         if not base.exists():
@@ -1980,10 +2039,8 @@ def folder_sizes(path: str = "", top_n: int = 10) -> str:
 
 
 def set_volume(level: int) -> str:
-    """Set system volume 0-100 on Windows."""
     level = max(0, min(100, level))
     try:
-        # Uses Windows scripting interface
         script = (
             f"$obj = New-Object -ComObject WScript.Shell; "
             f"$vol = [Math]::Round({level} / 2); "
@@ -2017,7 +2074,7 @@ def set_reminder(message: str, minutes: float) -> str:
         desktop_notify("JARVIS — Reminder", message)
         speak(f"Sir, a reminder: {message}")
         if gui_app:
-            gui_app.add_message("⏰ Reminder", message, tag="system")
+            gui_app.after(0, lambda: gui_app.add_message("⏰ Reminder", message, tag="system"))
 
     threading.Thread(target=_fire, daemon=True).start()
     eta = (datetime.now() + timedelta(minutes=minutes)).strftime("%H:%M")
@@ -2086,7 +2143,6 @@ def dispatch(action: dict) -> str:
     elif a == "clipboard_write":return clipboard_write(action.get("text",""))
     elif a == "remind":         return set_reminder(action.get("message",""), float(action.get("minutes",5)))
     elif a == "run_script":     return run_script(action.get("path",""))
-    # ── New actions ──────────────────────────
     elif a == "add_note":       return add_note(action.get("text",""))
     elif a == "list_notes":     return list_notes(bool(action.get("show_done", False)))
     elif a == "done_note":      return done_note(int(action.get("id", 0)))
@@ -2097,27 +2153,66 @@ def dispatch(action: dict) -> str:
     elif a == "folder_sizes":   return folder_sizes(action.get("path",""), int(action.get("top_n",10)))
     elif a == "set_volume":     return set_volume(int(action.get("level",50)))
     elif a == "mute":           return mute_volume()
+    elif a == "learned_command": return run_learned_command(action.get("command",""))
+    elif a == "learn_trigger": return handle_learn_trigger(action.get("phrase",""))
     else:
         return f"Unknown action: '{a}'"
 
 
+def _load_learned() -> list:
+    LEARNED_FILE = Path(__file__).parent / "jarvis_learned.json"
+    if LEARNED_FILE.exists():
+        try:
+            return json.loads(LEARNED_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return []
+
+
+def _save_learned(learned_list: list):
+    LEARNED_FILE = Path(__file__).parent / "jarvis_learned.json"
+    LEARNED_FILE.write_text(json.dumps(learned_list, indent=2), encoding="utf-8")
+
+
+def run_learned_command(command_str: str) -> str:
+    if not command_str:
+        return "No command stored."
+    return dispatch({"action": "run_command", "cmd": command_str})
+
+
+def handle_learn_trigger(phrase: str) -> str:
+    if not phrase:
+        return "I didn't catch the phrase to learn, sir."
+    speak(f"I'll learn how to {phrase}. Please show me the command you want me to run when you say that.")
+    command_raw = listen_for_command("What command should I run?")
+    if not command_raw:
+        speak("I didn't hear a command, sir. Learning cancelled.")
+        return "Learning cancelled due to no input."
+    speak(f"You said: {command_raw}. Is that correct?")
+    if not voice_confirm("Please confirm YES or NO."):
+        speak("Learning cancelled.")
+        return "Learning cancelled."
+    learned = _load_learned()
+    for entry in learned:
+        if entry.get("trigger", "").lower() == phrase.lower():
+            entry["command"] = command_raw.strip()
+            _save_learned(learned)
+            speak(f"I've updated the learned command for {phrase}, sir.")
+            return f"Updated learned command for {phrase}."
+    learned.append({"trigger": phrase.strip(), "command": command_raw.strip()})
+    _save_learned(learned)
+    speak(f"I've learned to {phrase} when you say that, sir.")
+    return f"Learned new command for {phrase}."
+
 
 import re as _re
 def _direct_intent(t: str, raw: str):
-    """
-    Returns (action_dict, spoken_reply) if the command is unambiguous,
-    or None to fall through to the AI.
-    """
-    # ── Minimize window ─────────────────────
-    # "minimize brave", "minimise spotify", "minimize file manager"
     min_m = _re.search(r'(?:minimise|minimize)\s+(.+)', t)
     if min_m:
         target = min_m.group(1).strip()
         return ({"action": "minimize_win", "name": target},
                 f"Minimising {target}.")
 
-    # ── Open link / URL ─────────────────────
-    # "open youtube.com", "go to reddit.com", "open https://..."
     url_match = _re.search(
         r'(?:open|go to|navigate to|launch|browse to)\s+(https?://\S+|[\w\-]+\.\w{2,}(?:/\S*)?)',
         t)
@@ -2128,7 +2223,6 @@ def _direct_intent(t: str, raw: str):
         return ({"action": "open_link", "url": url},
                 f"Opening {url_match.group(1)} now, sir.")
 
-    # ── Switch tab ───────────────────────────
     if _re.search(r'(next|forward|right)\s+tab|switch\s+tab\s*(forward|next|right)?|tab\s+right', t):
         return ({"action": "switch_tab", "direction": "next"},
                 "Switching to the next tab.")
@@ -2136,19 +2230,15 @@ def _direct_intent(t: str, raw: str):
         return ({"action": "switch_tab", "direction": "prev"},
                 "Switching to the previous tab.")
 
-    # ── Switch window ────────────────────────
     sw = _re.search(r'(?:switch to|focus|bring up|go to|open|pull up|show)\s+(.+?)(?:\s+window)?$', t)
     if sw:
         title = sw.group(1).strip()
-        # Don't intercept tab navigation or app-launch phrases handled elsewhere
         skip = {"next tab", "previous tab", "prev tab", "youtube", "spotify"}
         skip_prefixes = ("https://", "http://", "www.")
         if title not in skip and not any(title.startswith(p) for p in skip_prefixes):
             return ({"action": "focus_app", "name": title},
                     f"Switching to {title}, sir.")
 
-    # ── Mouse move ───────────────────────────
-    # "move mouse to top right", "move cursor to 900 500", "mouse to bottom left"
     screen_w, screen_h = 1920, 1080
     try:
         if PYAUTOGUI_OK:
@@ -2178,14 +2268,12 @@ def _direct_intent(t: str, raw: str):
             if name in t:
                 return ({"action": "mouse_move", "x": x, "y": y},
                         f"Moving the cursor to the {name}, sir.")
-        # Numeric coords: "move mouse to 800 400"
         nums = _re.findall(r'\d+', t)
         if len(nums) >= 2:
             x, y = int(nums[-2]), int(nums[-1])
             return ({"action": "mouse_move", "x": x, "y": y},
                     f"Moving the cursor to {x}, {y}.")
 
-    # ── Mouse click ──────────────────────────
     if _re.search(r'(?:click|left.click)\s+(?:at\s+)?(\d+)[,\s]+(\d+)', t):
         m = _re.search(r'(\d+)[,\s]+(\d+)', t)
         x, y = int(m.group(1)), int(m.group(2))
@@ -2197,7 +2285,6 @@ def _direct_intent(t: str, raw: str):
         return ({"action": "mouse_click", "x": x, "y": y, "button": "right"},
                 f"Right-clicking at {x}, {y}.")
 
-    # ── Scroll ───────────────────────────────
     if _re.search(r'scroll\s+(?:the\s+page\s+)?(?:down|up)', t):
         direction = "down" if "down" in t else "up"
         amt_m = _re.search(r'(\d+)', t)
@@ -2205,7 +2292,6 @@ def _direct_intent(t: str, raw: str):
         return ({"action": "mouse_scroll", "direction": direction, "amount": amt},
                 f"Scrolling {direction}.")
 
-    # ── Keyboard hotkeys ─────────────────────
     hotkey_map = {
         r'copy':          (["ctrl", "c"], "Copied to clipboard."),
         r'paste':         (["ctrl", "v"], "Pasted from clipboard."),
@@ -2226,21 +2312,25 @@ def _direct_intent(t: str, raw: str):
         if _re.search(pattern, t):
             return ({"action": "keyboard_hotkey", "keys": keys}, reply)
 
-    # ── Type text ────────────────────────────
     type_m = _re.search(r"type\s+(?:out\s+)?(.+?)\s*$", raw.strip(), _re.IGNORECASE)
     if type_m:
         text_to_type = type_m.group(1)
         return ({"action": "keyboard_type", "text": text_to_type},
                 f"Typing that out for you, sir.")
 
-    return None   # fall through to AI
+    learned = _load_learned()
+    for entry in learned:
+        trigger = entry.get("trigger", "").strip().lower()
+        if trigger and t == trigger:
+            command = entry.get("command", "").strip()
+            if command:
+                return ({"action": "learned_command", "command": command},
+                        f"Running learned command for {trigger}, sir.")
 
+    return None
 
 
 def _direct_intent_extended(t: str, raw: str):
-    """Extra direct-intent patterns for new features."""
-
-    # ── pip install ──────────────────────────
     m = _re.search(r'(?:pip\s+)?install\s+(?:package\s+)?(.+)', t)
     if m and not _re.search(r'(ollama|app|application|program|software)', t):
         pkgs = m.group(1).strip()
@@ -2253,7 +2343,6 @@ def _direct_intent_extended(t: str, raw: str):
         return ({"action": "pip_uninstall", "packages": pkgs},
                 f"Uninstalling {pkgs}, sir.")
 
-    # ── git clone ────────────────────────────
     m = _re.search(r'(?:git\s+)?clone\s+(https?://\S+|git@\S+)', t)
     if m:
         url  = m.group(1).rstrip(".")
@@ -2261,7 +2350,6 @@ def _direct_intent_extended(t: str, raw: str):
         return ({"action": "git_clone", "url": url, "dest": dest},
                 f"Cloning the repository, sir.")
 
-    # ── git status / pull ────────────────────
     m = _re.search(r'git\s+(status|pull|log|branch|fetch|diff|stash)(?:\s+in\s+(.+))?', t)
     if m:
         cmd  = m.group(1)
@@ -2269,7 +2357,6 @@ def _direct_intent_extended(t: str, raw: str):
         return ({"action": "git_run", "cmd": cmd, "path": path},
                 f"Running git {cmd}, sir.")
 
-    # ── weather ──────────────────────────────
     m = _re.search(r'(?:weather|temperature|forecast)(?:\s+(?:in|for|at))?\s+([a-zA-Z][a-zA-Z\s,]+)', t)
     if m:
         loc = m.group(1).strip()
@@ -2279,12 +2366,10 @@ def _direct_intent_extended(t: str, raw: str):
         return ({"action": "weather", "location": "London"},
                 "Checking local weather, sir.")
 
-    # ── screenshot ───────────────────────────
     if _re.search(r'screenshot|screen\s*shot|capture\s+(?:the\s+)?screen', t):
         return ({"action": "screenshot", "path": ""},
                 "Capturing the screen, sir.")
 
-    # ── clipboard ────────────────────────────
     if _re.search(r"(?:read|get|what.s\s+(?:on|in))\s+(?:my\s+)?clipboard", t):
         return ({"action": "clipboard_read"},
                 "Reading your clipboard, sir.")
@@ -2293,7 +2378,6 @@ def _direct_intent_extended(t: str, raw: str):
         return ({"action": "clipboard_write", "text": m.group(1)},
                 "Copied to clipboard, sir.")
 
-    # ── reminders ────────────────────────────
     m = _re.search(r'remind\s+(?:me\s+)?(?:in\s+)?(\d+)\s+(minute|min|hour|hr)s?\s*(?:to\s+(.+))?', t)
     if m:
         amount = int(m.group(1))
@@ -2303,21 +2387,18 @@ def _direct_intent_extended(t: str, raw: str):
         return ({"action": "remind", "message": msg, "minutes": mins},
                 f"Reminder set for {mins} minutes from now, sir.")
 
-    # ── real web search ──────────────────────
     m = _re.search(r'search\s+(?:the\s+web\s+(?:for\s+)?|online\s+(?:for\s+)?|for\s+)(.+)', t)
     if m:
         query = m.group(1).strip()
         return ({"action": "web_search_read", "query": query},
                 f"Searching for {query}, sir.")
 
-    # ── run script ───────────────────────────
     m = _re.search(r'run\s+(?:script\s+)?(?:file\s+)?["\']?(.+\.(?:py|bat|sh|ps1|cmd))["\']?', t)
     if m:
         path = m.group(1).strip()
         return ({"action": "run_script", "path": path},
                 f"Running {Path(path).name}, sir.")
 
-    # ── notes / todo ─────────────────────────
     m = _re.search(r'(?:add\s+(?:a\s+)?note|note\s+(?:down|that)?|remember\s+(?:that\s+)?|todo[:\s]+)\s*(.+)', t)
     if m:
         text = m.group(1).strip()
@@ -2335,32 +2416,27 @@ def _direct_intent_extended(t: str, raw: str):
         return ({"action": "delete_note", "id": int(m.group(1))},
                 f"Note {m.group(1)} deleted, sir.")
 
-    # ── ping ─────────────────────────────────
     m = _re.search(r'ping\s+([\w.\-]+)', t)
     if m:
         return ({"action": "ping", "host": m.group(1)},
                 f"Pinging {m.group(1)}, sir.")
 
-    # ── network status ───────────────────────
     if _re.search(r'(?:network|internet|connection|wifi|ip\s+address)\s*(?:status|info|check|speed)?', t):
         return ({"action": "network_status"},
                 "Checking network status, sir.")
 
-    # ── recent files ─────────────────────────
     m = _re.search(r'recent\s+files?(?:\s+in\s+(.+))?', t)
     if m:
         path = m.group(1).strip() if m.group(1) else ""
         return ({"action": "recent_files", "path": path},
                 "Pulling recent files, sir.")
 
-    # ── folder sizes ─────────────────────────
     if _re.search(r'(?:disk\s+usage|folder\s+sizes?|what(?:\'?s| is)\s+taking\s+(?:up\s+)?space)', t):
         m = _re.search(r'in\s+(.+?)(?:\s*$)', t)
         path = m.group(1).strip() if m else ""
         return ({"action": "folder_sizes", "path": path},
                 "Analysing folder sizes, sir.")
 
-    # ── volume control ───────────────────────
     if _re.search(r'mute|silence\s+(?:the\s+)?(?:volume|audio|sound)', t):
         return ({"action": "mute"}, "Muting, sir.")
     m = _re.search(r'(?:set\s+)?volume\s+(?:to\s+)?(\d+)', t)
@@ -2368,7 +2444,6 @@ def _direct_intent_extended(t: str, raw: str):
         return ({"action": "set_volume", "level": int(m.group(1))},
                 f"Setting volume to {m.group(1)} percent, sir.")
     if _re.search(r'(?:turn\s+(?:up|down)|increase|decrease|lower|raise)\s+(?:the\s+)?(?:volume|audio|sound)', t):
-        # Relative volume: +/- 20
         delta = 20 if any(w in t for w in ("up","increase","raise")) else -20
         return ({"action": "set_volume", "level": 50 + delta},
                 f"Adjusting volume, sir.")
@@ -2379,16 +2454,18 @@ def _direct_intent_extended(t: str, raw: str):
 
 # ─────────────────────────────────────────────
 #  COMMAND HANDLER
+#  IMPORTANT: handle_command must ALWAYS run on a daemon thread, never the
+#  main/GUI thread.  All GUI mutations go through gui_app.after(0, ...).
 # ─────────────────────────────────────────────
 def handle_command(text: str):
     if not text:
         return
     if gui_app:
-        gui_app.set_status("Thinking…")
+        gui_app.after(0, lambda: gui_app.set_status("Thinking…"))
 
     t = text.strip().lower()
 
-    # Built-ins
+    # ── Built-ins ──────────────────────────────────────────────────────────
     if t in ("help", "commands", "what can you do", "jarvis help"):
         help_text = (
             "I'm at your disposal, sir. Built-in commands: status, clear memory, settings, quit. "
@@ -2401,27 +2478,33 @@ def handle_command(text: str):
             "'set volume to 50', 'mute', or just ask me anything naturally."
         )
         speak(help_text)
-        if gui_app: gui_app.set_status("Ready")
+        if gui_app:
+            gui_app.after(0, lambda: gui_app.set_status("Ready"))
         return
 
     if t in ("status", "system status", "system stats"):
         result = system_stats()
-        if gui_app: gui_app.add_message("System", result, tag="system")
+        if gui_app:
+            gui_app.after(0, lambda r=result: gui_app.add_message("System", r, tag="system"))
         cpu = psutil.cpu_percent(interval=0.5)
         ram = psutil.virtual_memory().percent
         speak(f"CPU's at {cpu:.0f}%, RAM at {ram:.0f}%. Looking fine.")
-        if gui_app: gui_app.set_status("Ready")
+        if gui_app:
+            gui_app.after(0, lambda: gui_app.set_status("Ready"))
         return
 
     if t in ("clear", "clear history", "clear memory", "reset", "forget everything", "new conversation"):
         chat_history.clear()
         speak("Done. Fresh start.")
-        if gui_app: gui_app.set_status("Ready")
+        if gui_app:
+            gui_app.after(0, lambda: gui_app.set_status("Ready"))
         return
 
     if t in ("reconfigure", "setup", "settings", "change settings", "change my name"):
-        if gui_app: gui_app.open_settings()
-        if gui_app: gui_app.set_status("Ready")
+        if gui_app:
+            gui_app.after(0, gui_app.open_settings)
+        if gui_app:
+            gui_app.after(0, lambda: gui_app.set_status("Ready"))
         return
 
     if t in ("quit", "exit", "bye", "goodbye", "shut down", "shutdown", "turn off"):
@@ -2432,48 +2515,57 @@ def handle_command(text: str):
 
     if t in ("minimize", "minimise", "minimise window", "minimize window"):
         if gui_app:
-            gui_app.iconify()       # minimise to taskbar (still visible in taskbar)
+            gui_app.after(0, gui_app.iconify)
         speak("Minimised.")
-        if gui_app: gui_app.set_status("Ready")
+        if gui_app:
+            gui_app.after(0, lambda: gui_app.set_status("Ready"))
         return
 
     if t in ("hide", "go to tray", "hide window", "tray"):
         if gui_app:
-            gui_app.withdraw()      # hide completely to system tray
+            gui_app.after(0, gui_app.withdraw)
         speak("Hidden to tray, sir.")
-        if gui_app: gui_app.set_status("Ready")
+        if gui_app:
+            gui_app.after(0, lambda: gui_app.set_status("Ready"))
         return
 
     if t in ("enable startup", "start on boot", "add to startup", "run on startup", "autostart"):
         result = register_startup()
         speak(result)
-        if gui_app: gui_app.set_status("Ready")
+        if gui_app:
+            gui_app.after(0, lambda: gui_app.set_status("Ready"))
         return
 
     if t in ("disable startup", "remove from startup", "don't start on boot", "remove autostart"):
         result = unregister_startup()
         speak(result)
-        if gui_app: gui_app.set_status("Ready")
+        if gui_app:
+            gui_app.after(0, lambda: gui_app.set_status("Ready"))
         return
 
-    # ── Direct intent matching (bypass AI for reliability) ──────────────────
+    # ── Direct intent (bypass AI) ──────────────────────────────────────────
     direct = _direct_intent(t, text) or _direct_intent_extended(t, text)
     if direct is not None:
         action, reply = direct
-        if gui_app: gui_app.set_status(f"Running: {action.get('action')}…")
+        if gui_app:
+            gui_app.after(0, lambda a=action: gui_app.set_status(f"Running: {a.get('action')}…"))
         result = dispatch(action)
-        if gui_app: gui_app.add_message("Result", result, tag="system")
+        if gui_app:
+            gui_app.after(0, lambda r=result: gui_app.add_message("Result", r, tag="system"))
         speak(reply)
-        if gui_app: gui_app.set_status("Ready")
+        if gui_app:
+            gui_app.after(0, lambda: gui_app.set_status("Ready"))
         return
 
-    # AI
+    # ── AI path ────────────────────────────────────────────────────────────
     response = ask_ai(text)
     action   = extract_action(response)
     if action:
-        if gui_app: gui_app.set_status(f"Running: {action.get('action')}…")
+        if gui_app:
+            gui_app.after(0, lambda a=action: gui_app.set_status(f"Running: {a.get('action')}…"))
         result = dispatch(action)
-        if gui_app: gui_app.add_message("Result", result, tag="system")
+        if gui_app:
+            gui_app.after(0, lambda r=result: gui_app.add_message("Result", r, tag="system"))
         owner   = CFG.get("owner_name", "the user")
         summary = ask_ai(
             f"[Result of {action.get('action')}]\n{result[:600]}\n\n"
@@ -2484,7 +2576,8 @@ def handle_command(text: str):
     else:
         speak(response)
 
-    if gui_app: gui_app.set_status("Ready")
+    if gui_app:
+        gui_app.after(0, lambda: gui_app.set_status("Ready"))
 
 
 
@@ -2508,36 +2601,26 @@ def background_monitor():
 
 
 def make_geass_icon(size: int = 64) -> Image.Image:
-    """
-    Draw a Code Geass-inspired Geass sigil icon.
-    Stylised eye with a star/spoke crown motif in crimson and gold on dark.
-    """
     img  = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
     cx, cy = size // 2, size // 2
     r = size // 2 - 2
 
-    # Dark background circle
     draw.ellipse([cx - r, cy - r, cx + r, cy + r],
                  fill=(10, 0, 5, 230), outline=(180, 0, 30), width=max(1, size // 32))
 
-    # Outer ring (gold)
     ro = int(r * 0.88)
     draw.ellipse([cx - ro, cy - ro, cx + ro, cy + ro],
                  outline=(200, 160, 20), width=max(1, size // 22))
 
-    # Inner iris ring (crimson)
     ri = int(r * 0.55)
     draw.ellipse([cx - ri, cy - ri, cx + ri, cy + ri],
                  outline=(220, 20, 40), width=max(1, size // 28))
 
-    # Pupil (glowing red-white core)
     rp = int(r * 0.22)
     draw.ellipse([cx - rp, cy - rp, cx + rp, cy + rp],
                  fill=(240, 30, 50), outline=(255, 180, 180), width=max(1, size // 40))
 
-    # Six-pointed star spokes (Geass star motif)
-    # Alternating long (even) and short (odd) spokes
     spoke_outer = int(r * 0.83)
     spoke_inner = int(r * 0.55)
     spoke_w     = max(1, size // 40)
@@ -2551,7 +2634,6 @@ def make_geass_icon(size: int = 64) -> Image.Image:
         colour = (200, 160, 20) if i % 2 == 0 else (220, 20, 40)
         draw.line([x1, y1, x2, y2], fill=colour, width=spoke_w)
 
-    # Diamond tips on the 3 long spokes
     tip_r = max(1, size // 20)
     for i in range(0, 6, 2):
         angle_rad = math.radians(i * 60 - 90)
@@ -2560,7 +2642,6 @@ def make_geass_icon(size: int = 64) -> Image.Image:
         draw.ellipse([tx - tip_r, ty - tip_r, tx + tip_r, ty + tip_r],
                      fill=(220, 180, 30))
 
-    # Wing arcs sweeping left and right
     wing_r = int(r * 0.70)
     wing_w = max(1, size // 28)
     draw.arc([cx - wing_r - int(r*0.25), cy - wing_r,
@@ -2574,7 +2655,6 @@ def make_geass_icon(size: int = 64) -> Image.Image:
 
 
 def _set_window_icon(root: tk.Tk):
-    """Set the taskbar / title-bar icon to the Geass sigil."""
     try:
         import io, tempfile, os as _os
         icon_img = make_geass_icon(64)
@@ -2597,12 +2677,10 @@ def _set_window_icon(root: tk.Tk):
 
 
 def make_tray_image() -> Image.Image:
-    """Return the Geass sigil as the system tray icon."""
     return make_geass_icon(64)
 
 
 def show_jarvis_tray(icon, item):
-    """Restore the main window from tray."""
     if gui_app:
         gui_app.after(0, gui_app.deiconify)
         gui_app.after(0, lambda: gui_app.lift())
@@ -2637,11 +2715,6 @@ def run_tray():
 
 
 def _list_microphones() -> list[tuple[int, str]]:
-    """
-    Return a list of (device_index, name) tuples for all input devices.
-    Tries PyAudio/speech_recognition first, falls back to sounddevice,
-    then falls back to Windows MMDevice via subprocess.
-    """
     if _PYAUDIO_OK:
         try:
             return list(enumerate(sr.Microphone.list_microphone_names()))
@@ -2665,7 +2738,6 @@ def _list_microphones() -> list[tuple[int, str]]:
         except Exception:
             pass
 
-    # Last resort: query Windows audio devices via PowerShell
     try:
         import subprocess as _sp
         ps = (
@@ -2686,7 +2758,6 @@ def _list_microphones() -> list[tuple[int, str]]:
 
 
 class SettingsDialog(tk.Toplevel):
-    # Colours mirroring the main window
     BG    = "#0d1117"
     PANEL = "#161b22"
     ACCENT= "#58a6ff"
@@ -2722,13 +2793,11 @@ class SettingsDialog(tk.Toplevel):
         self.resizable(True, True)
         self.geometry("460x580")
 
-        # Header (fixed, outside scroll)
         header = tk.Frame(self, bg=self.PANEL, height=56)
         header.pack(fill="x")
         tk.Label(header, text="⚙  Settings", bg=self.PANEL, fg=self.ACCENT,
                  font=("Segoe UI", 14, "bold")).pack(side="left", padx=16, pady=12)
 
-        # ── Scrollable body ───────────────────────────────────────────────────
         body = tk.Frame(self, bg=self.BG)
         body.pack(fill="both", expand=True)
 
@@ -2739,25 +2808,20 @@ class SettingsDialog(tk.Toplevel):
         scrollbar.pack(side="right", fill="y")
         canvas.pack(side="left", fill="both", expand=True)
 
-        # Inner frame that holds all the form widgets
         form = tk.Frame(canvas, bg=self.PANEL)
         form_window = canvas.create_window((0, 0), window=form, anchor="nw")
 
-        # Keep the canvas window width in sync with the canvas
         def _on_canvas_resize(event):
             canvas.itemconfig(form_window, width=event.width)
         canvas.bind("<Configure>", _on_canvas_resize)
 
-        # Update scroll region when form grows
         def _on_form_resize(event):
             canvas.configure(scrollregion=canvas.bbox("all"))
         form.bind("<Configure>", _on_form_resize)
 
-        # Mouse-wheel scrolling (Windows & Linux)
         def _on_mousewheel(event):
             canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
         canvas.bind_all("<MouseWheel>", _on_mousewheel)
-        # Unbind when dialog closes so it doesn't affect the main window
         self.protocol("WM_DELETE_WINDOW", lambda: (
             canvas.unbind_all("<MouseWheel>"), self.destroy()))
 
@@ -2781,7 +2845,6 @@ class SettingsDialog(tk.Toplevel):
         self._label(form, "RAM alert %", 5)
         self.ram_var = self._entry(form, 5, str(CFG.get("ram_alert", 90)))
 
-        # Microphone picker
         self._label(form, "Microphone", 6)
         mics = _list_microphones()
 
@@ -2790,7 +2853,6 @@ class SettingsDialog(tk.Toplevel):
         self.mic_cb["values"] = [f"[{i}] {n}" for i, n in mics] if mics else ["(no mics found)"]
         cur_mic = CFG.get("mic_index")
         if cur_mic is not None and mics:
-            # Find the position in the list whose device index matches cur_mic
             pos = next((pos for pos, (dev_idx, _) in enumerate(mics) if dev_idx == cur_mic), 0)
             self.mic_cb.current(pos)
         elif mics:
@@ -2798,7 +2860,6 @@ class SettingsDialog(tk.Toplevel):
         self.mic_cb.grid(row=6, column=1, padx=12, pady=6, sticky="ew")
         self._mic_list = mics
 
-        # ── Start on boot toggle ──────────────
         self._label(form, "Start on boot", 7)
         self._startup_var = tk.BooleanVar(value=is_startup_registered())
         tk.Checkbutton(form, variable=self._startup_var,
@@ -2808,9 +2869,6 @@ class SettingsDialog(tk.Toplevel):
                        text="Launch JARVIS at Windows login"
                        ).grid(row=7, column=1, padx=12, pady=6, sticky="w")
 
-        # ── Buttons (fixed at bottom, outside scroll) ────────────────────────
-        # We need these packed before `body` so they anchor to the bottom.
-        # Rebuild packing order: destroy & re-pack body after buttons.
         body.pack_forget()
         btn_frame = tk.Frame(self, bg=self.BG)
         btn_frame.pack(side="bottom", fill="x", padx=16, pady=12)
@@ -2855,25 +2913,16 @@ class SettingsDialog(tk.Toplevel):
         save_config(CFG)
         if tts_engine:
             tts_engine.setProperty("rate", speed)
-        # Handle startup toggle
         if self._startup_var.get():
             register_startup()
         else:
             unregister_startup()
         self.destroy()
         if gui_app:
-            gui_app.add_message("JARVIS", "Settings saved.", tag="jarvis")
-
-
-
+            gui_app.after(0, lambda: gui_app.add_message("JARVIS", "Settings saved.", tag="jarvis"))
 
 
 class SplashScreen(tk.Toplevel):
-    """
-    Arc-reactor style loading screen shown while JARVIS initialises.
-    Displays a spinning ring, animated status messages, and a progress bar.
-    Call .finish() to fade it out once the main window is ready.
-    """
     BG     = "#050a0f"
     ACCENT = "#00b4d8"
     ACCENT3= "#48cae4"
@@ -2891,7 +2940,7 @@ class SplashScreen(tk.Toplevel):
 
     def __init__(self, root: tk.Tk):
         super().__init__(root)
-        self.overrideredirect(True)          # borderless
+        self.overrideredirect(True)
         self.attributes("-topmost", True)
         self.configure(bg=self.BG)
         w, h = 520, 360
@@ -2910,48 +2959,39 @@ class SplashScreen(tk.Toplevel):
         self._advance_text()
 
     def _build(self):
-        # Arc canvas (centre top)
         self.arc_canvas = tk.Canvas(self, width=140, height=140,
                                      bg=self.BG, highlightthickness=0)
         self.arc_canvas.pack(pady=(32, 0))
 
-        # Title
         tk.Label(self, text="J.A.R.V.I.S.", bg=self.BG, fg=self.ACCENT,
                  font=("Courier New", 22, "bold")).pack(pady=(8, 0))
         tk.Label(self, text="JUST A RATHER VERY INTELLIGENT SYSTEM",
                  bg=self.BG, fg=self.FG_DIM,
                  font=("Courier New", 7)).pack()
 
-        # Status line
         self._status_var = tk.StringVar(value=self._BOOT_LINES[0])
         tk.Label(self, textvariable=self._status_var, bg=self.BG, fg=self.ACCENT3,
                  font=("Courier New", 9)).pack(pady=(18, 4))
 
-        # Progress bar (canvas-drawn so we can style it)
         self.prog_canvas = tk.Canvas(self, width=380, height=6,
                                       bg="#0a1520", highlightthickness=0)
         self.prog_canvas.pack()
         self.prog_bar = self.prog_canvas.create_rectangle(0, 0, 0, 6,
                                                            fill=self.ACCENT, outline="")
 
-    # ── Spinning arc reactor ──────────────────
     def _draw_arc(self):
         c = self.arc_canvas
         c.delete("all")
         cx, cy, r_outer, r_inner, r_core = 70, 70, 60, 44, 14
 
-        # Outer static ring
         c.create_oval(cx-r_outer, cy-r_outer, cx+r_outer, cy+r_outer,
                       outline=self.FG_DIM, width=1)
-        # Spinning arc (270° sweep, rotates)
         c.create_arc(cx-r_outer+3, cy-r_outer+3,
                      cx+r_outer-3, cy+r_outer-3,
                      start=self._angle, extent=270,
                      outline=self.ACCENT, width=3, style="arc")
-        # Inner ring
         c.create_oval(cx-r_inner, cy-r_inner, cx+r_inner, cy+r_inner,
-                      outline=self.ACCENT2 if hasattr(self, "ACCENT2") else "#0077b6", width=1)
-        # Core glow
+                      outline="#0077b6", width=1)
         c.create_oval(cx-r_core, cy-r_core, cx+r_core, cy+r_core,
                       fill=self.ACCENT, outline=self.ACCENT3, width=2)
 
@@ -2960,24 +3000,20 @@ class SplashScreen(tk.Toplevel):
             return
         self._angle = (self._angle + 6) % 360
         self._draw_arc()
-        self.after(16, self._spin)   # ~60 fps
+        self.after(16, self._spin)
 
-    # ── Status text cycling ───────────────────
     def _advance_text(self):
         if not self._alive:
             return
         if self._line_idx < len(self._BOOT_LINES):
             self._status_var.set(self._BOOT_LINES[self._line_idx])
-            # Update progress bar
             frac = self._line_idx / max(len(self._BOOT_LINES) - 1, 1)
             self.prog_canvas.coords(self.prog_bar, 0, 0, int(380 * frac), 6)
             self._line_idx += 1
             delay = 900 if self._line_idx < len(self._BOOT_LINES) else 400
             self.after(delay, self._advance_text)
 
-    # ── Fade out and destroy ──────────────────
     def finish(self):
-        """Fade the splash out smoothly, then destroy."""
         self._alive = False
         self._status_var.set("SYSTEMS ONLINE.")
         self.prog_canvas.coords(self.prog_bar, 0, 0, 380, 6)
@@ -2996,13 +3032,12 @@ class SplashScreen(tk.Toplevel):
 
 
 class JarvisApp(tk.Tk):
-    # ── Palette ──────────────────────────────
-    BG       = "#050a0f"   # deep space black
-    PANEL    = "#0a1520"   # dark blue-grey panel
-    BORDER   = "#1a3a5c"   # electric blue border
-    ACCENT   = "#00b4d8"   # cyan arc-reactor blue
-    ACCENT2  = "#0077b6"   # deeper blue
-    ACCENT3  = "#48cae4"   # bright highlight
+    BG       = "#050a0f"
+    PANEL    = "#0a1520"
+    BORDER   = "#1a3a5c"
+    ACCENT   = "#00b4d8"
+    ACCENT2  = "#0077b6"
+    ACCENT3  = "#48cae4"
     JARVIS_C = "#00b4d8"
     USER_C   = "#90e0ef"
     SYS_C    = "#4a7fa5"
@@ -3027,23 +3062,18 @@ class JarvisApp(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._tick_clock()
         self._animate_arc()
-        # Apply Geass sigil as window/taskbar icon
         self.after(100, lambda: _set_window_icon(self))
 
-    # ── UI construction ──────────────────────
     def _build_ui(self):
-        # ── Top bar ──────────────────────────
         topbar = tk.Frame(self, bg=self.PANEL, height=64)
         topbar.pack(fill="x", side="top")
         topbar.pack_propagate(False)
 
-        # Arc-reactor logo canvas
         self.canvas_logo = tk.Canvas(topbar, width=52, height=52,
                                       bg=self.PANEL, highlightthickness=0)
         self.canvas_logo.pack(side="left", padx=(14, 8), pady=6)
         self._draw_arc(0)
 
-        # Title block
         title_block = tk.Frame(topbar, bg=self.PANEL)
         title_block.pack(side="left", pady=6)
         tk.Label(title_block, text="J.A.R.V.I.S.", bg=self.PANEL, fg=self.ACCENT,
@@ -3053,13 +3083,11 @@ class JarvisApp(tk.Tk):
         tk.Label(title_block, text=sub, bg=self.PANEL, fg=self.FG_DIM,
                  font=("Courier New", 8)).pack(anchor="w")
 
-        # Live clock (right side)
         self._clock_var = tk.StringVar(value="")
         tk.Label(topbar, textvariable=self._clock_var,
                  bg=self.PANEL, fg=self.ACCENT3,
                  font=("Courier New", 11)).pack(side="right", padx=18)
 
-        # Right buttons
         btn_kw = dict(bg=self.PANEL, fg=self.FG_DIM, relief="flat",
                       font=("Courier New", 9), cursor="hand2",
                       activebackground=self.BORDER, activeforeground=self.ACCENT,
@@ -3068,10 +3096,8 @@ class JarvisApp(tk.Tk):
         tk.Button(topbar, text="[ STATUS ]",   command=self._cmd_status,   **btn_kw).pack(side="right", padx=2)
         tk.Button(topbar, text="[ CLEAR ]",    command=self._cmd_clear,    **btn_kw).pack(side="right", padx=2)
 
-        # ── Thin accent line under topbar ────
         tk.Frame(self, bg=self.ACCENT, height=1).pack(fill="x")
 
-        # ── Chat area ────────────────────────
         chat_frame = tk.Frame(self, bg=self.BG)
         chat_frame.pack(fill="both", expand=True)
 
@@ -3089,7 +3115,6 @@ class JarvisApp(tk.Tk):
         )
         self.chat.pack(fill="both", expand=True)
 
-        # Text tags
         self.chat.tag_config("jarvis",      foreground=self.ACCENT,  font=("Courier New", 11, "bold"))
         self.chat.tag_config("jarvis_body", foreground=self.FG,       font=("Courier New", 11))
         self.chat.tag_config("user",        foreground=self.USER_C,   font=("Courier New", 11, "bold"))
@@ -3098,10 +3123,8 @@ class JarvisApp(tk.Tk):
         self.chat.tag_config("time",        foreground=self.FG_DIM,   font=("Courier New", 9))
         self.chat.tag_config("divider",     foreground=self.BORDER,   font=("Courier New", 9))
 
-        # ── Thin line above input ────────────
         tk.Frame(self, bg=self.BORDER, height=1).pack(fill="x")
 
-        # ── Bottom bar ───────────────────────
         bottom = tk.Frame(self, bg=self.PANEL, height=60)
         bottom.pack(fill="x", side="bottom")
         bottom.pack_propagate(False)
@@ -3142,7 +3165,6 @@ class JarvisApp(tk.Tk):
         )
         self.send_btn.pack(side="right", padx=12, pady=10)
 
-        # ── Status bar ───────────────────────
         self.status_var = tk.StringVar(value="● STANDBY")
         status_bar = tk.Frame(self, bg=self.BG, height=20)
         status_bar.pack(fill="x", side="bottom")
@@ -3153,26 +3175,20 @@ class JarvisApp(tk.Tk):
         tk.Label(status_bar, text=f'SAY "{wake}" TO ACTIVATE VOICE  //  FAILSAFE: MOUSE TOP-LEFT',
                  bg=self.BG, fg=self.FG_DIM, font=("Courier New", 8)).pack(side="right", padx=12)
 
-    # ── Arc-reactor animated logo ────────────
     def _draw_arc(self, angle: float):
         c = self.canvas_logo
         c.delete("all")
         cx, cy, r = 26, 26, 22
-        # Outer ring
         c.create_oval(cx-r, cy-r, cx+r, cy+r, outline=self.BORDER, width=1)
-        # Spinning arc
         c.create_arc(cx-r, cy-r, cx+r, cy+r,
                      start=angle, extent=240,
                      outline=self.ACCENT, width=2, style="arc")
-        # Middle ring
         r2 = 14
         c.create_oval(cx-r2, cy-r2, cx+r2, cy+r2, outline=self.ACCENT2, width=1)
-        # Core glow
         r3 = 7
         c.create_oval(cx-r3, cy-r3, cx+r3, cy+r3,
                       fill=self.ACCENT if self._pulse_running else self.ACCENT2,
                       outline=self.ACCENT3, width=1)
-        # Hex spokes (6 lines from centre to ring)
         for i in range(6):
             rad = math.radians(i * 60 + angle * 0.3)
             x2 = cx + r2 * math.cos(rad)
@@ -3184,13 +3200,11 @@ class JarvisApp(tk.Tk):
         self._draw_arc(self._arc_angle)
         self.after(40, self._animate_arc)
 
-    # ── Live clock ───────────────────────────
     def _tick_clock(self):
         now = datetime.now()
         self._clock_var.set(now.strftime("%H:%M:%S  //  %d %b %Y"))
         self.after(1000, self._tick_clock)
 
-    # ── Wake-word flash ──────────────────────
     def flash_wake(self):
         if self._pulse_running:
             return
@@ -3205,7 +3219,6 @@ class JarvisApp(tk.Tk):
         else:
             self._pulse_running = False
 
-    # ── Chat helpers ─────────────────────────
     def add_message(self, sender: str, text: str, tag: str = "system"):
         self.chat.configure(state="normal")
         ts = datetime.now().strftime("%H:%M:%S")
@@ -3230,14 +3243,16 @@ class JarvisApp(tk.Tk):
         self.status_var.set(f"{prefix} {msg.upper()}")
         self.update_idletasks()
 
-    # ── Actions ──────────────────────────────
     def _on_send(self, event=None):
         text = self.input_var.get().strip()
         if not text:
             return
         self.input_var.set("")
         self.add_message("You", text, tag="user")
-        threading.Thread(target=handle_command, args=(text,), daemon=True).start()
+        # Always dispatch to a daemon thread — never block the GUI thread
+        threading.Thread(
+            target=handle_command, args=(text,), daemon=True, name="cmd-gui"
+        ).start()
 
     def _toggle_mic(self):
         global listening
@@ -3246,7 +3261,9 @@ class JarvisApp(tk.Tk):
         self.set_status(f"Wake word: {'active' if listening else 'muted'}")
 
     def _cmd_status(self):
-        threading.Thread(target=lambda: handle_command("status"), daemon=True).start()
+        threading.Thread(
+            target=lambda: handle_command("status"), daemon=True, name="cmd-status"
+        ).start()
 
     def _cmd_clear(self):
         chat_history.clear()
@@ -3259,8 +3276,7 @@ class JarvisApp(tk.Tk):
         SettingsDialog(self)
 
     def _on_close(self):
-        """Minimize to system tray instead of quitting."""
-        self.withdraw()          # hide the window (keeps process alive)
+        self.withdraw()
         desktop_notify(
             "JARVIS — Running in background",
             "J.A.R.V.I.S. is still active. Use the tray icon to restore or quit."
@@ -3269,7 +3285,6 @@ class JarvisApp(tk.Tk):
 
 
 def gui_setup_wizard():
-    """Simple GUI first-run setup using standard dialogs."""
     root = tk.Tk()
     root.withdraw()
 
@@ -3284,7 +3299,6 @@ def gui_setup_wizard():
     if not name:
         name = os.getlogin().title()
 
-    # Mic selection
     mics = _list_microphones()
 
     mic_idx = 0
@@ -3329,16 +3343,13 @@ _STARTUP_REG_NAME = "JARVIS_Vanitas"
 
 
 def _get_vbs_launcher_path() -> Path:
-    """Return the path to start_jarvis.vbs next to this script."""
     return Path(__file__).parent / "start_jarvis.vbs"
 
 
 def register_startup() -> str:
-    """Add JARVIS to Windows startup via the registry (runs at login, no console)."""
     import winreg
     vbs = _get_vbs_launcher_path()
     if not vbs.exists():
-        # Auto-create the VBS launcher if it's missing
         vbs.write_text(
             'Dim s: Set s = CreateObject("WScript.Shell")\r\n'
             f's.Run "pythonw """ & Left(WScript.ScriptFullName, InStrRev(WScript.ScriptFullName,"\\")) & "jarvis_gui.py""", 0, False\r\n',
@@ -3355,7 +3366,6 @@ def register_startup() -> str:
 
 
 def unregister_startup() -> str:
-    """Remove JARVIS from Windows startup."""
     import winreg
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _STARTUP_REG_KEY,
@@ -3385,23 +3395,20 @@ def main():
     CFG = load_config()
     if not CFG.get("owner_name"):
         CFG = gui_setup_wizard()
-        CFG = load_config()  # reload after wizard saves
+        CFG = load_config()
 
     HOME_DIR = Path.home()
 
-    # Check Ollama — try multiple addresses, accept any response (even errors mean it's up)
     _ollama_running = False
     for _ollama_addr in ("http://localhost:11434", "http://127.0.0.1:11434"):
         try:
             _r = requests.get(_ollama_addr, timeout=5)
             _ollama_running = True
-            # Save whichever address worked
             CFG["ollama_url"] = _ollama_addr + "/api/chat"
             break
         except requests.exceptions.ConnectionError:
             continue
         except Exception:
-            # Any other exception (timeout, bad status) still means Ollama is reachable
             _ollama_running = True
             CFG["ollama_url"] = _ollama_addr + "/api/chat"
             break
@@ -3421,24 +3428,19 @@ def main():
 
     init_tts()
 
-    # ── Auto-register startup on first run ───
     if not is_startup_registered():
         register_startup()
 
-    # ── Single Tk root — splash is a Toplevel child of it ───────────────────
-    # JarvisApp IS the one-and-only tk.Tk(); SplashScreen is a Toplevel on top.
     gui_app = JarvisApp()
-    gui_app.withdraw()                       # hide main window while splash plays
+    gui_app.withdraw()
 
-    splash = SplashScreen(gui_app)           # Toplevel parented to the real root
+    splash = SplashScreen(gui_app)
     splash.update()
 
-    # Background threads (safe to start now — gui_app exists)
     threading.Thread(target=background_monitor, daemon=True).start()
     threading.Thread(target=wake_word_loop,      daemon=True).start()
     threading.Thread(target=run_tray,            daemon=True).start()
 
-    # After splash sequence completes, fade it out and show main window
     total_splash_ms = len(SplashScreen._BOOT_LINES) * 900 + 600
 
     def _show_main():
@@ -3453,9 +3455,10 @@ def main():
         period = "morning" if hour < 12 else "afternoon" if hour < 17 else "evening"
         owner  = CFG.get("owner_name", "")
         name   = owner if owner else "sir"
-        gui_app.after(400, lambda: speak(
-            f"Good {period}, {name}. Everything's up and running."
-        ))
+        gui_app.after(400, lambda: threading.Thread(
+            target=lambda: speak(f"Good {period}, {name}. Everything's up and running."),
+            daemon=True, name="speak-greeting"
+        ).start())
 
     gui_app.after(total_splash_ms, _show_main)
     gui_app.mainloop()
