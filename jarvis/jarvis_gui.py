@@ -1,4 +1,3 @@
-
 from playsound import playsound
 import os, sys, json, re, shutil, time, threading, subprocess, webbrowser, math
 from jarvis_learning import (
@@ -121,6 +120,10 @@ gui_app      = None   # reference to the main GUI window
 # ── TTS queue: all audio is serialised through a single background thread ──
 _tts_queue: queue.Queue = queue.Queue()
 
+# ── TTS interrupt: set this event to stop speech mid-sentence ──
+_tts_stop_event = threading.Event()
+_speech_muted   = False  # persistent mute — only toggled by the mute button
+
 _JARVIS_VOICE   = "en-GB-RyanNeural"  
 _JARVIS_RATE    = "-3%"                 
 _JARVIS_PITCH   = "-8Hz"               
@@ -146,38 +149,84 @@ def init_tts():
         tts_engine = None
 
 
+# Dedicated pygame channel for all JARVIS speech — lets us call .stop()
+# on exactly this channel without touching other pygame sounds.
+_tts_channel: "pygame.mixer.Channel | None" = None
+
+def _init_tts_channel():
+    global _tts_channel
+    if _PYGAME_OK:
+        try:
+            pygame.mixer.set_num_channels(8)
+            _tts_channel = pygame.mixer.Channel(7)  # reserve channel 7 for speech
+        except Exception:
+            _tts_channel = None
+
+_init_tts_channel()
+
+
 def _speak_edge_sync(text: str):
-    async def _run():
+    """Synthesise speech via edge-tts, load into pygame Sound (in-memory),
+    and play on the dedicated speech channel so it can be hard-stopped."""
+    async def _synthesise():
         communicator = edge_tts.Communicate(
             text,
             voice=_JARVIS_VOICE,
             rate=_JARVIS_RATE,
             pitch=_JARVIS_PITCH,
         )
-        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
-            tmp_path = f.name
-        await communicator.save(tmp_path)
-        return tmp_path
+        import io
+        buf = io.BytesIO()
+        async for chunk in communicator.stream():
+            # Abort synthesis mid-stream if interrupted
+            if _tts_stop_event.is_set():
+                return None
+            if chunk["type"] == "audio":
+                buf.write(chunk["data"])
+        buf.seek(0)
+        return buf
 
-    tmp_path = None
     try:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
-            tmp_path = loop.run_until_complete(_run())
+            buf = loop.run_until_complete(_synthesise())
         finally:
             loop.close()
 
-        playsound(tmp_path)
+        if buf is None or _tts_stop_event.is_set():
+            return  # interrupted during synthesis or before playback
+
+        if _PYGAME_OK and _tts_channel is not None:
+            sound = pygame.mixer.Sound(buf)
+            _tts_channel.play(sound)
+            # Poll until done or interrupted
+            while _tts_channel.get_busy():
+                if _tts_stop_event.is_set():
+                    _tts_channel.stop()
+                    # Flush pygame audio buffer immediately
+                    try:
+                        pygame.mixer.stop()
+                    except Exception:
+                        pass
+                    return
+                time.sleep(0.03)
+        else:
+            # Fallback: write to temp file and use playsound
+            import io as _io
+            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+                f.write(buf.read())
+                tmp_path = f.name
+            try:
+                playsound(tmp_path)
+            finally:
+                try:
+                    os.unlink(tmp_path)
+                except Exception:
+                    pass
 
     except Exception as e:
         print(f"[edge-tts] {e}")
-    finally:
-        if tmp_path:
-            try:
-                os.unlink(tmp_path)
-            except Exception:
-                pass
 
 
 def _tts_worker():
@@ -186,6 +235,9 @@ def _tts_worker():
         if text is None:
             break
         try:
+            if _tts_stop_event.is_set():
+                # Discard stale queued item
+                continue
             if _EDGE_TTS_OK:
                 _speak_edge_sync(text)
             elif tts_engine:
@@ -199,28 +251,76 @@ def _tts_worker():
         finally:
             _tts_queue.task_done()
 
-# Start the TTS worker once at import time (restarts if it ever crashes)
-_tts_thread = threading.Thread(target=_tts_worker, daemon=True, name="tts-worker")
 
-# Start the TTS worker once at import time (restarts if it ever crashes)
+def interrupt_speech():
+    """
+    Hard-stop all current and queued speech immediately.
+    Sets the stop flag and stops pygame — does NOT clear the flag.
+    The flag stays set until speak() is called again, which clears it
+    just before queuing new audio. This prevents the race where the flag
+    gets cleared before the worker thread has actually stopped.
+    """
+    _tts_stop_event.set()
+    if _PYGAME_OK:
+        try:
+            if _tts_channel is not None:
+                _tts_channel.stop()
+            pygame.mixer.stop()
+        except Exception:
+            pass
+    # Drain all pending items from the queue
+    while not _tts_queue.empty():
+        try:
+            _tts_queue.get_nowait()
+            _tts_queue.task_done()
+        except Exception:
+            break
+
+
+# Start the TTS worker once at import time
 _tts_thread = threading.Thread(target=_tts_worker, daemon=True, name="tts-worker")
 _tts_thread.start()
+
+
+def _split_sentences(text: str) -> list:
+    """Split text into sentence chunks so the TTS queue has many small items
+    that can each be drained/skipped if interrupt_speech() fires between them."""
+    # Split on sentence-ending punctuation followed by whitespace or end
+    chunks = re.split(r'(?<=[.!?])\s+', text.strip())
+    # Also split very long chunks on comma+space to keep chunks short
+    result = []
+    for chunk in chunks:
+        if len(chunk) > 120:
+            sub = re.split(r',\s+', chunk)
+            result.extend(s.strip() for s in sub if s.strip())
+        elif chunk.strip():
+            result.append(chunk.strip())
+    return result if result else [text]
 
 
 def speak(text: str):
     """
     Non-blocking speak: strips markdown, updates the GUI immediately,
-    then queues audio for the TTS worker thread.
+    then queues each sentence individually so interrupt_speech() can
+    drain between sentences for a near-instant cutoff.
+    Clears the stop flag first so new speech actually plays.
     """
     clean = re.sub(r'[*_`#]', '', text)
     clean = re.sub(r'\{[^}]*\}', '', clean).strip()
     if not clean:
         return
-    # GUI update is always safe via .after() — never call Tkinter directly from
-    # a non-main thread.
+    if _speech_muted:
+        # Still show text in GUI but don't play audio
+        if gui_app:
+            gui_app.after(0, lambda t=clean: gui_app.add_message("JARVIS", t, tag="jarvis"))
+        return
+    # Clear any pending stop so this new speech plays normally
+    _tts_stop_event.clear()
     if gui_app:
         gui_app.after(0, lambda t=clean: gui_app.add_message("JARVIS", t, tag="jarvis"))
-    _tts_queue.put(clean)
+    # Queue each sentence separately so the stop flag is checked between them
+    for sentence in _split_sentences(clean):
+        _tts_queue.put(sentence)
 
 
 def voice_confirm(prompt: str) -> bool:
@@ -469,6 +569,8 @@ def wake_word_loop():
             text = recognizer.recognize_google(audio).lower()
             corrected, _chg = _apply_corrections(text)
             if wake_word in corrected or wake_word in text:
+                # Stop any ongoing speech immediately
+                interrupt_speech()
                 if gui_app:
                     def _restore_gui():
                         if gui_app.state() in ("withdrawn", "iconic"):
@@ -563,7 +665,13 @@ EXAMPLE 13 — user asks to set volume:
 {"action": "set_volume", "level": 40}
 Setting volume to 40 percent, sir.
 
+EXAMPLE 14 — user asks to do multiple things (open notepad and chrome):
+{"action": "open_app", "name": "notepad"}
+{"action": "open_app", "name": "chrome"}
+Opening Notepad and Chrome for you, sir.
+
 CRITICAL: Never say you cannot move the mouse, open links, switch tabs, or type — you CAN do all of these. Just emit the correct JSON.
+When the user asks to do multiple things, emit multiple JSON objects (one per line) then a single spoken reply at the end.
 """
 
     actions = f"""
@@ -676,6 +784,31 @@ def extract_action(text: str) -> dict | None:
         except Exception:
             pass
     return None
+
+
+def extract_all_actions(text: str) -> list[dict]:
+    """Return every JSON action object found in the AI response (in order)."""
+    actions = []
+    for match in re.finditer(r'\{[^{}]*"action"[^{}]*\}', text):
+        try:
+            actions.append(json.loads(match.group()))
+        except Exception:
+            pass
+    return actions
+
+
+def _split_multi_command(text: str) -> list[str]:
+    """Split a single utterance into multiple sub-commands on connectors like
+    'and then', 'then', 'after that', 'also', etc.
+    Returns a list of stripped sub-strings; at minimum [text] unchanged."""
+    # Preserve "and then open X" / "then do Y" / "also Z" / "after that W"
+    parts = re.split(
+        r'\s+(?:and\s+then|then|after\s+that|also|and\s+also|next)\s+',
+        text,
+        flags=re.IGNORECASE,
+    )
+    parts = [p.strip() for p in parts if p.strip()]
+    return parts if parts else [text]
 
 
 # ─────────────────────────────────────────────
@@ -2453,6 +2586,51 @@ def _direct_intent_extended(t: str, raw: str):
 
 
 # ─────────────────────────────────────────────
+#  SINGLE-COMMAND EXECUTOR  (no multi-command splitting)
+# ─────────────────────────────────────────────
+def _run_single_command(text: str):
+    """Execute exactly one command (no multi-split).  Called by handle_command."""
+    if not text or not text.strip():
+        return
+    t = text.strip().lower()
+    if gui_app:
+        gui_app.after(0, lambda: gui_app.set_status("Thinking..."))
+
+    # ── Direct intent (fast path, no AI) ──────────────────────────────────
+    direct = _direct_intent(t, text) or _direct_intent_extended(t, text)
+    if direct is not None:
+        action, reply = direct
+        if gui_app:
+            gui_app.after(0, lambda a=action: gui_app.set_status(f"Running {a.get('action')}"))
+        result = dispatch(action)
+        if gui_app:
+            gui_app.after(0, lambda r=result: gui_app.add_message("Result", r, tag="system"))
+        speak(reply)
+        return
+
+    # ── AI path ────────────────────────────────────────────────────────────
+    response = ask_ai(text)
+    actions  = extract_all_actions(response)
+
+    if actions:
+        for action in actions:
+            if gui_app:
+                gui_app.after(0, lambda a=action: gui_app.set_status(f"Running {a.get('action')}"))
+            result = dispatch(action)
+            if gui_app:
+                gui_app.after(0, lambda r=result: gui_app.add_message("Result", r, tag="system"))
+        # Speak just the text lines from the AI response (strip the JSON action lines)
+        spoken = "\n".join(
+            line for line in response.splitlines()
+            if not line.strip().startswith("{")
+        ).strip()
+        if spoken:
+            speak(spoken)
+    else:
+        speak(response)
+
+
+# ─────────────────────────────────────────────
 #  COMMAND HANDLER
 #  IMPORTANT: handle_command must ALWAYS run on a daemon thread, never the
 #  main/GUI thread.  All GUI mutations go through gui_app.after(0, ...).
@@ -2475,7 +2653,8 @@ def handle_command(text: str):
             "'remind me in 10 minutes to call Bob', 'search online for Python tips', "
             "'run script myscript.py', 'add note buy milk', 'show my notes', "
             "'ping google.com', 'network status', 'recent files', 'folder sizes', "
-            "'set volume to 50', 'mute', or just ask me anything naturally."
+            "'set volume to 50', 'mute', or just ask me anything naturally. "
+            "You can chain commands too — just say 'open notepad and then open chrome'."
         )
         speak(help_text)
         if gui_app:
@@ -2543,39 +2722,22 @@ def handle_command(text: str):
             gui_app.after(0, lambda: gui_app.set_status("Ready"))
         return
 
-    # ── Direct intent (bypass AI) ──────────────────────────────────────────
-    direct = _direct_intent(t, text) or _direct_intent_extended(t, text)
-    if direct is not None:
-        action, reply = direct
-        if gui_app:
-            gui_app.after(0, lambda a=action: gui_app.set_status(f"Running: {a.get('action')}…"))
-        result = dispatch(action)
-        if gui_app:
-            gui_app.after(0, lambda r=result: gui_app.add_message("Result", r, tag="system"))
-        speak(reply)
+    # ── Multi-command split ────────────────────────────────────────────────
+    # Split "open notepad and then open chrome" into individual sub-commands.
+    # Each sub runs through _run_single_command which handles direct-intent
+    # AND AI fallback, so mixed commands like "open chrome and then what's 2+2"
+    # work correctly too.
+    sub_commands = _split_multi_command(text)
+    if len(sub_commands) > 1:
+        speak(f"On it, running {len(sub_commands)} commands, sir.")
+        for sub in sub_commands:
+            _run_single_command(sub)
         if gui_app:
             gui_app.after(0, lambda: gui_app.set_status("Ready"))
         return
 
-    # ── AI path ────────────────────────────────────────────────────────────
-    response = ask_ai(text)
-    action   = extract_action(response)
-    if action:
-        if gui_app:
-            gui_app.after(0, lambda a=action: gui_app.set_status(f"Running: {a.get('action')}…"))
-        result = dispatch(action)
-        if gui_app:
-            gui_app.after(0, lambda r=result: gui_app.add_message("Result", r, tag="system"))
-        owner   = CFG.get("owner_name", "the user")
-        summary = ask_ai(
-            f"[Result of {action.get('action')}]\n{result[:600]}\n\n"
-            f"Give a short 1-2 sentence spoken summary for {owner}."
-        )
-        if not extract_action(summary):
-            speak(summary)
-    else:
-        speak(response)
-
+    # ── Single command ─────────────────────────────────────────────────────
+    _run_single_command(text)
     if gui_app:
         gui_app.after(0, lambda: gui_app.set_status("Ready"))
 
@@ -3138,6 +3300,15 @@ class JarvisApp(tk.Tk):
         )
         self.mic_btn.pack(side="left", padx=(12, 4), pady=10)
 
+        self.mute_btn = tk.Button(
+            bottom, text="⏹", font=("Courier New", 16),
+            bg=self.INPUT_BG, fg="#ff7b72", relief="flat",
+            cursor="hand2", padx=10,
+            activebackground=self.BORDER, activeforeground="#ff7b72",
+            command=self._mute_speech
+        )
+        self.mute_btn.pack(side="left", padx=(0, 4), pady=10)
+
         self.input_var = tk.StringVar()
         self.input_box = tk.Entry(
             bottom, textvariable=self.input_var,
@@ -3151,6 +3322,7 @@ class JarvisApp(tk.Tk):
         )
         self.input_box.pack(side="left", fill="x", expand=True, padx=4, pady=10, ipady=7)
         self.input_box.bind("<Return>",   self._on_send)
+        self.bind("<Escape>", lambda e: self._mute_speech())
         self.input_box.bind("<FocusIn>",  lambda e: self.input_box.config(highlightbackground=self.ACCENT))
         self.input_box.bind("<FocusOut>", lambda e: self.input_box.config(highlightbackground=self.BORDER))
 
@@ -3259,6 +3431,25 @@ class JarvisApp(tk.Tk):
         listening = not listening
         self.mic_btn.config(fg=self.ACCENT if listening else "#ff7b72")
         self.set_status(f"Wake word: {'active' if listening else 'muted'}")
+
+    def _toggle_mute_speech(self):
+        """Toggle persistent speech mute. Only this button can unmute."""
+        global _speech_muted
+        if _speech_muted:
+            # Unmute
+            _speech_muted = False
+            _tts_stop_event.clear()
+            self.mute_btn.config(fg="#ff7b72", text="⏹")
+            self.set_status("Speech unmuted")
+        else:
+            # Mute — stop immediately and stay muted
+            _speech_muted = True
+            interrupt_speech()
+            self.mute_btn.config(fg=self.ACCENT, text="▶")
+            self.set_status("Speech muted — click ▶ to unmute")
+
+    def _mute_speech(self):
+        self._toggle_mute_speech()
 
     def _cmd_status(self):
         threading.Thread(
