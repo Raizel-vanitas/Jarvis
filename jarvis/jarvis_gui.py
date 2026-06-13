@@ -275,6 +275,9 @@ def interrupt_speech():
             _tts_queue.task_done()
         except Exception:
             break
+    # Deactivate particle system when speech is interrupted
+    if gui_app:
+        gui_app.after(0, lambda: gui_app._set_speech_active(False))
 
 
 # Start the TTS worker once at import time
@@ -318,9 +321,14 @@ def speak(text: str):
     _tts_stop_event.clear()
     if gui_app:
         gui_app.after(0, lambda t=clean: gui_app.add_message("JARVIS", t, tag="jarvis"))
+        # Activate particle system when speech starts
+        gui_app.after(0, lambda: gui_app._set_speech_active(True))
     # Queue each sentence separately so the stop flag is checked between them
     for sentence in _split_sentences(clean):
         _tts_queue.put(sentence)
+    # Deactivate particle system slightly after speech ends
+    if gui_app:
+        gui_app.after(len(clean) * 80, lambda: gui_app._set_speech_active(False))
 
 
 def voice_confirm(prompt: str) -> bool:
@@ -622,6 +630,20 @@ EXAMPLE 2 — user asks to move mouse to top right:
 {"action": "mouse_move", "x": 1880, "y": 20}
 Moving the cursor to the top-right corner, sir.
 
+EXAMPLE 2b — user asks to left-click at a position:
+{"action": "mouse_click", "x": 960, "y": 540, "button": "left", "double": false}
+Left-clicking there now, sir.
+
+MOUSE MOVEMENT RULES — READ CAREFULLY:
+- "top right" / "top-right corner" → x near screen width, y near 0
+- "bottom left" / "bottom-left corner" → x near 0, y near screen height
+- "right" alone (e.g. "move it right", "move it just right", "a bit to the right") → RELATIVE nudge: add ~100px to current x. Use {"action": "mouse_move", "x": CURRENT_X+100, "y": CURRENT_Y}
+- "left" alone → subtract ~100px from current x
+- "up" alone → subtract ~100px from current y
+- "down" alone → add ~100px to current y
+- If the user gives exact pixel coordinates, use those directly.
+- NEVER map a bare directional word like "right" to a screen corner. "Move it right" ≠ "move it to the top-right corner".
+
 EXAMPLE 3 — user asks to switch tab:
 {"action": "switch_tab", "direction": "next"}
 Switching to the next tab.
@@ -695,6 +717,7 @@ AVAILABLE JSON ACTIONS:
 {{"action": "web_search",     "query": "search term"}}
 {{"action": "open_link",      "url": "https://youtube.com"}}
 {{"action": "mouse_move",     "x": 960, "y": 540}}
+{{"action": "mouse_move_rel", "dx": 100, "dy": 0}}   ← relative nudge (use for "move it right/left/up/down")
 {{"action": "mouse_click",    "x": 960, "y": 540, "button": "left", "double": false}}
 {{"action": "mouse_scroll",   "direction": "down", "amount": 3}}
 {{"action": "keyboard_type",  "text": "Hello"}}
@@ -726,6 +749,25 @@ AVAILABLE JSON ACTIONS:
 {{"action": "mute"}}
 """
 
+    web_rules = """
+=== REAL-TIME WEB BROWSING — CRITICAL RULES ===
+You have live web search. Use it proactively. NEVER answer from your training data when the answer could be outdated.
+
+ALWAYS use {"action": "web_search_read", "query": "..."} for ANY of these:
+  • News, current events, recent announcements
+  • Prices (stocks, crypto, products)
+  • Sports scores, fixtures, results, tables
+  • Weather (unless user already said location and you just called get_weather)
+  • New film/TV releases, trailers, reviews
+  • "Who is...", "What happened to...", "Is X still..."
+  • Anything with words: today, now, latest, current, recently, this week, breaking
+  • Any factual question where your training data might be stale
+
+Do NOT say "I don't have real-time data" — you DO. Use web_search_read.
+Do NOT answer news/current-events questions from memory. Always search first.
+
+"""
+
     persona = (
         f"You are J.A.R.V.I.S., {owner}'s personal AI. Think Paul Bettany's portrayal - "
         "warm, quietly witty, genuinely engaged, and very human in how you talk. "
@@ -750,7 +792,7 @@ AVAILABLE JSON ACTIONS:
         "You're J.A.R.V.I.S. Not a chatbot. Just yourself."
     )
 
-    return persona + examples + actions
+    return web_rules + persona + examples + actions
 
 
 
@@ -1324,12 +1366,45 @@ def open_link(url: str) -> str:
         return f"Error opening link: {e}"
 
 
+def _precise_mouse_move(x: int, y: int, duration: float = 0.35) -> tuple[int, int]:
+    """Move the mouse to (x, y) using easeOutQuad for smooth deceleration,
+    then verify and nudge to the exact pixel if pyautogui over/undershoots."""
+    # Clamp to screen bounds
+    sw, sh = pyautogui.size()
+    x = max(0, min(x, sw - 1))
+    y = max(0, min(y, sh - 1))
+
+    pyautogui.moveTo(x, y, duration=duration, tween=pyautogui.easeOutQuad)
+
+    # Verify and correct – pyautogui can be off by 1-2 px at high DPI
+    actual_x, actual_y = pyautogui.position()
+    if (actual_x, actual_y) != (x, y):
+        pyautogui.moveTo(x, y, duration=0.0)   # instant nudge
+
+    return pyautogui.position()
+
+
 def mouse_move(x: int, y: int) -> str:
     if not PYAUTOGUI_OK:
         return "pyautogui not installed. Run: pip install pyautogui"
     try:
-        pyautogui.moveTo(x, y, duration=0.4)
-        return f"✅ Mouse moved to ({x}, {y})"
+        actual_x, actual_y = _precise_mouse_move(x, y)
+        return f"✅ Mouse moved to ({actual_x}, {actual_y})"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+
+def mouse_move_rel(dx: int = 0, dy: int = 0) -> str:
+    """Move the mouse by a relative offset from its current position."""
+    if not PYAUTOGUI_OK:
+        return "pyautogui not installed. Run: pip install pyautogui"
+    try:
+        cur_x, cur_y = pyautogui.position()
+        target_x = cur_x + dx
+        target_y = cur_y + dy
+        actual_x, actual_y = _precise_mouse_move(target_x, target_y)
+        return f"✅ Mouse nudged by ({dx:+}, {dy:+}) → now at ({actual_x}, {actual_y})"
     except Exception as e:
         return f"Error: {e}"
 
@@ -1339,7 +1414,8 @@ def mouse_click(x: int | None = None, y: int | None = None, button: str = "left"
         return "pyautogui not installed. Run: pip install pyautogui"
     try:
         if x is not None and y is not None:
-            pyautogui.moveTo(x, y, duration=0.3)
+            _precise_mouse_move(x, y, duration=0.3)
+            time.sleep(0.05)   # brief pause so the OS registers cursor position before click
         if double:
             pyautogui.doubleClick(button=button)
         else:
@@ -1743,19 +1819,24 @@ def git_run(git_cmd: str, path: str = "") -> str:
 
 
 
-def web_search_read(query: str, num_results: int = 4) -> str:
+def web_search_read(query: str, num_results: int = 5) -> str:
     """
-    Search the web and return a readable summary of the top results.
-    Strategy:
-      1. DuckDuckGo Instant Answer API  (JSON, no scraping, very reliable)
-      2. DuckDuckGo HTML fallback        (parse the HTML page robustly)
-      3. Open browser as last resort
+    Search the web and return a readable, AI-summarised answer.
+    Strategy (in priority order):
+      0. Wikipedia API           (fast, accurate for factual/biographical queries)
+      1. DuckDuckGo Instant API  (good for definitions / simple facts)
+      2. Google News RSS         (real-time news)
+      3. Bing HTML scrape        (better quality results than DDG HTML)
+      4. DuckDuckGo HTML fallback
+      5. Scrape top pages for content
+      6. Ask local Ollama to summarise  (strict: use ONLY web content, not training data)
+      7. Open browser as last resort
     """
     HEADERS = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0 Safari/537.36"
+            "Chrome/124.0.0.0 Safari/537.36"
         ),
         "Accept-Language": "en-GB,en;q=0.9",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -1771,82 +1852,251 @@ def web_search_read(query: str, num_results: int = 4) -> str:
 
     def _clean_html(s: str) -> str:
         s = re.sub(r'<[^>]+>', ' ', s)
-        return html.unescape(s).strip()
+        return html.unescape(re.sub(r'\s+', ' ', s)).strip()
 
-    def _scrape_page(url: str, char_limit: int = 1400) -> str:
+    def _scrape_page(url: str, char_limit: int = 2500) -> str:
+        """Scrape a page and return the most relevant text content."""
         try:
-            r = requests.get(url, headers=HEADERS, timeout=9, allow_redirects=True)
+            r = requests.get(url, headers=HEADERS, timeout=10, allow_redirects=True)
             r.raise_for_status()
             ct = r.headers.get("Content-Type", "")
             if "text/html" not in ct:
                 return "(non-HTML page, skipped)"
             if _BS4_OK:
                 soup = BeautifulSoup(r.text, "html.parser")
-                for tag in soup(["script", "style", "nav", "footer",
-                                  "header", "aside", "form", "noscript",
-                                  "figure", "figcaption", "iframe"]):
+                # Remove noise elements
+                for tag in soup(["script", "style", "nav", "footer", "header",
+                                  "aside", "form", "noscript", "figure",
+                                  "figcaption", "iframe", "advertisement",
+                                  "cookie", "popup", "modal", "banner"]):
                     tag.decompose()
+                # Remove elements with ad/cookie/nav class hints
+                for tag in soup.find_all(True, class_=re.compile(
+                        r'(ad|cookie|banner|popup|newsletter|subscribe|social|'
+                        r'share|related|sidebar|widget|comment)', re.I)):
+                    tag.decompose()
+
+                # Priority content areas
                 body = (
                     soup.find("article") or
+                    soup.find(attrs={"itemprop": re.compile(r"(articleBody|description)", re.I)}) or
                     soup.find("main") or
-                    soup.find(attrs={"id": re.compile(r"(content|article|main|body)", re.I)}) or
-                    soup.find(attrs={"class": re.compile(r"(article|content|post|entry)", re.I)}) or
+                    soup.find(attrs={"id": re.compile(r"(content|article|main|body|wiki)", re.I)}) or
+                    soup.find(attrs={"class": re.compile(r"(article|content|post|entry|body|story)", re.I)}) or
                     soup.body
                 )
-                text = body.get_text(separator=" ", strip=True) if body else r.text
+
+                # Extract paragraphs specifically for better quality text
+                if body:
+                    paragraphs = body.find_all("p")
+                    if paragraphs:
+                        text = " ".join(p.get_text(separator=" ", strip=True)
+                                        for p in paragraphs if len(p.get_text(strip=True)) > 40)
+                    else:
+                        text = body.get_text(separator=" ", strip=True)
+                else:
+                    text = r.text
             else:
                 text = _clean_html(r.text)
+
             text = re.sub(r'\s+', ' ', text).strip()
             return text[:char_limit] + ("…" if len(text) > char_limit else "")
         except Exception as ex:
             return f"(couldn't read: {ex})"
 
-    # ── Strategy 1: DuckDuckGo Instant Answer / Zero-click API ───────────────
     results = []   # list of (url, title, snippet)
 
+    # ── Strategy 0: Wikipedia API — always try first ──────────────────────────
+    # Tried for ALL queries; returns nothing for very recent/niche topics and
+    # we fall through silently. Print statements go to the console for debugging.
+    if gui_app:
+        gui_app.after(0, lambda: gui_app.set_status("Checking Wikipedia…"))
     try:
-        api_url = (
-            "https://api.duckduckgo.com/?q="
-            + urllib.parse.quote_plus(query)
-            + "&format=json&no_redirect=1&no_html=1&skip_disambig=1"
+        wiki_search_url = (
+            "https://en.wikipedia.org/w/api.php?action=query&list=search"
+            "&srsearch=" + urllib.parse.quote_plus(query) +
+            "&srlimit=5&format=json&utf8=1"
         )
-        api_resp = requests.get(api_url, headers=HEADERS, timeout=8)
-        api_resp.raise_for_status()
-        data = api_resp.json()
+        ws = requests.get(wiki_search_url, headers=HEADERS, timeout=8)
+        ws.raise_for_status()
+        ws_data = ws.json()
+        search_hits = ws_data.get("query", {}).get("search", [])
+        print(f"[JARVIS wiki] hits for '{query}': {[h.get('title') for h in search_hits]}")
 
-        # Instant answer (AbstractText)
-        if data.get("AbstractText") and data.get("AbstractURL"):
-            results.append((
-                data["AbstractURL"],
-                data.get("Heading", query),
-                data["AbstractText"][:1400],
-            ))
-
-        # Related topics
-        for topic in data.get("RelatedTopics", []):
-            if len(results) >= num_results:
+        for hit in search_hits[:3]:
+            page_title = hit.get("title", "")
+            if not page_title:
+                continue
+            wiki_extract_url = (
+                "https://en.wikipedia.org/w/api.php?action=query&prop=extracts"
+                "&exintro=1&explaintext=1&redirects=1&format=json&utf8=1"
+                "&titles=" + urllib.parse.quote_plus(page_title)
+            )
+            we = requests.get(wiki_extract_url, headers=HEADERS, timeout=8)
+            we.raise_for_status()
+            we_data = we.json()
+            pages = we_data.get("query", {}).get("pages", {})
+            for pid, page in pages.items():
+                if pid == "-1":
+                    print(f"[JARVIS wiki] not found: {page_title}")
+                    continue
+                extract = page.get("extract", "").strip()
+                print(f"[JARVIS wiki] '{page_title}' extract len={len(extract)}")
+                if extract and len(extract) > 80:
+                    page_url = (
+                        "https://en.wikipedia.org/wiki/"
+                        + urllib.parse.quote(page_title.replace(" ", "_"))
+                    )
+                    results.append((page_url, f"Wikipedia: {page_title}", extract[:4000]))
+                    break
+            if results:
                 break
-            if isinstance(topic, dict) and topic.get("FirstURL") and topic.get("Text"):
-                results.append((
-                    topic["FirstURL"],
-                    topic["Text"][:80],
-                    topic["Text"][:1400],
-                ))
-            # Sometimes RelatedTopics contains sub-groups
-            elif isinstance(topic, dict) and "Topics" in topic:
-                for sub in topic["Topics"]:
-                    if len(results) >= num_results:
-                        break
-                    if sub.get("FirstURL") and sub.get("Text"):
-                        results.append((
-                            sub["FirstURL"],
-                            sub["Text"][:80],
-                            sub["Text"][:1400],
-                        ))
-    except Exception:
-        pass  # fall through to HTML strategy
+    except Exception as _wiki_err:
+        print(f"[JARVIS wiki] error: {_wiki_err}")
 
-    # ── Strategy 2: DuckDuckGo HTML page (robust multi-pattern parsing) ──────
+    # ── Strategy 1: DuckDuckGo Instant Answer / Zero-click API ───────────────
+    if len(results) < num_results:
+        try:
+            api_url = (
+                "https://api.duckduckgo.com/?q="
+                + urllib.parse.quote_plus(query)
+                + "&format=json&no_redirect=1&no_html=1&skip_disambig=1"
+            )
+            api_resp = requests.get(api_url, headers=HEADERS, timeout=8)
+            api_resp.raise_for_status()
+            data = api_resp.json()
+
+            existing_urls = {r[0] for r in results}
+
+            # Only use AbstractText if it's genuinely specific (not generic DDG guesses)
+            abstract = data.get("AbstractText", "").strip()
+            abstract_url = data.get("AbstractURL", "")
+            # Require at least 80 chars of abstract to be meaningful
+            if abstract and len(abstract) > 80 and abstract_url and abstract_url not in existing_urls:
+                results.append((abstract_url, data.get("Heading", query), abstract[:2000]))
+                existing_urls.add(abstract_url)
+
+            # Related topics — only add if they have real URLs
+            for topic in data.get("RelatedTopics", []):
+                if len(results) >= num_results:
+                    break
+                if isinstance(topic, dict) and topic.get("FirstURL") and topic.get("Text"):
+                    url_t = topic["FirstURL"]
+                    if url_t not in existing_urls and len(topic["Text"]) > 50:
+                        results.append((url_t, topic["Text"][:80], topic["Text"][:1400]))
+                        existing_urls.add(url_t)
+                elif isinstance(topic, dict) and "Topics" in topic:
+                    for sub in topic["Topics"]:
+                        if len(results) >= num_results:
+                            break
+                        if sub.get("FirstURL") and sub.get("Text") and sub["FirstURL"] not in existing_urls:
+                            if len(sub["Text"]) > 50:
+                                results.append((sub["FirstURL"], sub["Text"][:80], sub["Text"][:1400]))
+                                existing_urls.add(sub["FirstURL"])
+        except Exception:
+            pass
+
+    # ── Strategy 2: Google News RSS  (best for real-time / breaking news) ─────
+    NEWS_KEYWORDS = re.search(
+        r'\b(news|latest|today|tonight|breaking|live|now|current|price|stock|score|'
+        r'weather|forecast|match|result|winner|born|died|release|update|announce|'
+        r'just|recently|this week|this year)\b',
+        query, re.I
+    )
+    if NEWS_KEYWORDS and len(results) < num_results:
+        try:
+            rss_url = (
+                "https://news.google.com/rss/search?q="
+                + urllib.parse.quote_plus(query)
+                + "&hl=en-GB&gl=GB&ceid=GB:en"
+            )
+            rss_resp = requests.get(rss_url, headers=HEADERS, timeout=10)
+            rss_resp.raise_for_status()
+            items = re.findall(
+                r'<item>.*?<title>(.*?)</title>.*?<link>(.*?)</link>.*?'
+                r'(?:<description>(.*?)</description>)?.*?</item>',
+                rss_resp.text, re.DOTALL
+            )
+            existing_urls = {r[0] for r in results}
+            for raw_title, raw_url, raw_desc in items[:num_results * 2]:
+                title   = _clean_html(raw_title).strip()
+                url     = raw_url.strip()
+                snippet = _clean_html(raw_desc or "").strip()[:800]
+                if url and url not in existing_urls:
+                    results.append((url, title, snippet))
+                    existing_urls.add(url)
+                if len(results) >= num_results:
+                    break
+        except Exception:
+            pass
+
+    # ── Strategy 3: Bing HTML scrape (higher quality results than DDG HTML) ───
+    if len(results) < num_results:
+        try:
+            bing_url = (
+                "https://www.bing.com/search?q="
+                + urllib.parse.quote_plus(query)
+                + "&cc=GB&setlang=en-GB"
+            )
+            bing_headers = {**HEADERS, "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0"
+            )}
+            resp = requests.get(bing_url, headers=bing_headers, timeout=12)
+            resp.raise_for_status()
+            found_urls: list[tuple[str, str, str]] = []
+            existing_urls = {r[0] for r in results}
+
+            if _BS4_OK:
+                soup = BeautifulSoup(resp.text, "html.parser")
+                # Bing result structure: <li class="b_algo"> contains <h2><a href> and <div class="b_caption">
+                for li in soup.find_all("li", class_="b_algo"):
+                    h2 = li.find("h2")
+                    if not h2:
+                        continue
+                    a = h2.find("a")
+                    if not a:
+                        continue
+                    href  = a.get("href", "")
+                    title = a.get_text(strip=True)
+                    if not href.startswith("http") or href in existing_urls:
+                        continue
+                    # Snippet is in .b_caption p
+                    snip_el = li.find("div", class_="b_caption")
+                    snippet = ""
+                    if snip_el:
+                        p = snip_el.find("p")
+                        if p:
+                            snippet = p.get_text(separator=" ", strip=True)[:800]
+                    if title:
+                        found_urls.append((href, title, snippet))
+                        existing_urls.add(href)
+                    if len(found_urls) >= num_results * 2:
+                        break
+            else:
+                # Regex fallback for Bing
+                for m in re.finditer(
+                    r'<h2[^>]*><a href="(https?://(?!bing\.com)[^"]{10,300})"[^>]*>([^<]{3,150})</a>',
+                    resp.text
+                ):
+                    href  = m.group(1)
+                    title = _clean_html(m.group(2))
+                    if href not in existing_urls and title:
+                        found_urls.append((href, title, ""))
+                        existing_urls.add(href)
+                    if len(found_urls) >= num_results * 2:
+                        break
+
+            for url, title, snippet in found_urls:
+                if url not in {r[0] for r in results}:
+                    results.append((url, title, snippet))
+                if len(results) >= num_results:
+                    break
+        except Exception:
+            pass
+
+    # ── Strategy 4: DuckDuckGo HTML page fallback ─────────────────────────────
     if len(results) < num_results:
         try:
             ddg_url = (
@@ -1856,69 +2106,54 @@ def web_search_read(query: str, num_results: int = 4) -> str:
             resp = requests.get(ddg_url, headers=HEADERS, timeout=12)
             resp.raise_for_status()
             page = resp.text
-
             found_urls: list[tuple[str, str, str]] = []
+            existing_urls = {r[0] for r in results}
 
             if _BS4_OK:
                 soup = BeautifulSoup(page, "html.parser")
-
-                # Modern DDG HTML layout — result links sit in <a class="result__a">
-                # but the href is a DDG redirect; real URL is in uddg= param.
-                # We also try data-href and plain href as fallbacks.
                 for a_tag in soup.find_all("a", class_=re.compile(r"result__a|result-link")):
-                    href = a_tag.get("href", "")
+                    href  = a_tag.get("href", "")
                     title = a_tag.get_text(strip=True)
-
-                    # Unwrap DDG redirect URLs
                     if "duckduckgo.com/l/" in href or href.startswith("//duckduckgo.com"):
                         m = re.search(r'uddg=([^&]+)', href)
                         if m:
                             href = urllib.parse.unquote(m.group(1))
                         else:
                             continue
-                    if not href.startswith("http"):
+                    if not href.startswith("http") or href in existing_urls:
                         continue
-
-                    # Grab the snippet text from the sibling .result__snippet
                     snippet = ""
-                    parent = a_tag.find_parent(class_=re.compile(r"result"))
+                    parent  = a_tag.find_parent(class_=re.compile(r"result"))
                     if parent:
                         snip_el = parent.find(class_=re.compile(r"result__snippet|result-snippet"))
                         if snip_el:
                             snippet = snip_el.get_text(separator=" ", strip=True)[:800]
-
-                    if title and href not in [r[0] for r in found_urls]:
+                    if title:
                         found_urls.append((href, title, snippet))
+                        existing_urls.add(href)
                     if len(found_urls) >= num_results * 2:
                         break
             else:
-                # Pure-regex fallback (no bs4) — tries several known DDG patterns
                 patterns = [
-                    # Pattern A: uddg= redirect (classic DDG HTML)
                     r'uddg=([^&"]+)[^>]*?>[^<]*<[^>]+>([^<]{3,120})</a',
-                    # Pattern B: data-href on result link
                     r'data-href="(https?://[^"]{10,300})"[^>]*>\s*<[^>]+>([^<]{3,120})</a',
-                    # Pattern C: plain href to external site
                     r'href="(https?://(?!duckduckgo)[^"]{10,300})"[^>]*class="[^"]*result[^"]*"[^>]*>([^<]{3,120})</a',
                 ]
                 for pat in patterns:
                     for m in re.finditer(pat, page, re.DOTALL):
-                        raw_href = urllib.parse.unquote(m.group(1))
+                        raw_href  = urllib.parse.unquote(m.group(1))
                         raw_title = _clean_html(m.group(2))
-                        if raw_href.startswith("http") and raw_title:
-                            if raw_href not in [r[0] for r in found_urls]:
-                                found_urls.append((raw_href, raw_title, ""))
+                        if raw_href.startswith("http") and raw_title and raw_href not in existing_urls:
+                            found_urls.append((raw_href, raw_title, ""))
+                            existing_urls.add(raw_href)
                         if len(found_urls) >= num_results * 2:
                             break
                     if len(found_urls) >= num_results:
                         break
 
-            # Merge into results, skipping duplicates
-            existing_urls = {r[0] for r in results}
             for url, title, snippet in found_urls:
-                if url not in existing_urls:
+                if url not in {r[0] for r in results}:
                     results.append((url, title, snippet))
-                    existing_urls.add(url)
                 if len(results) >= num_results:
                     break
 
@@ -1932,36 +2167,100 @@ def web_search_read(query: str, num_results: int = 4) -> str:
         web_search(query)
         return "Couldn't pull results right now. Opened the search in your browser."
 
-    # ── Scrape pages that have no snippet yet ────────────────────────────────
-    lines = [f"🔍 Web results for: \"{query}\"\n"]
+    # ── Gather raw content from each result ──────────────────────────────────
+    raw_chunks: list[str] = []
+    source_lines: list[str] = [f"🔍 Sources for: \"{query}\"\n"]
+    wikipedia_title:   str = ""
+    wikipedia_excerpt: str = ""   # first Wikipedia article's full extract
+
     for i, item in enumerate(results[:num_results], 1):
         url, title, snippet = item
         if gui_app:
             gui_app.after(0, lambda i=i, n=min(len(results), num_results):
                           gui_app.set_status(f"Reading result {i}/{n}…"))
 
-        # Use existing snippet if it's meaty enough, otherwise scrape
-        if len(snippet) < 200:
-            scraped = _scrape_page(url)
+        if "wikipedia.org" in url and len(snippet) >= 300:
+            excerpt = snippet
+            if not wikipedia_excerpt:
+                wikipedia_excerpt = snippet
+                wikipedia_title   = title
+        elif len(snippet) < 300:
+            scraped = _scrape_page(url, char_limit=2500)
             excerpt = scraped if not scraped.startswith("(couldn't") else (snippet or scraped)
         else:
             excerpt = snippet
 
-        lines.append(f"{'─'*60}")
-        lines.append(f"{i}. {title}")
-        lines.append(f"   {url}")
-        lines.append(f"   {excerpt}\n")
+        source_lines.append(f"{i}. {title}  —  {url}")
+        raw_chunks.append(f"SOURCE {i} [{title}]:\n{excerpt}")
 
-    if not _BS4_OK:
-        lines.append(
-            "💡 Tip: install beautifulsoup4 for richer scraping — "
-            "pip install beautifulsoup4"
+    raw_context = "\n\n".join(raw_chunks)
+
+    # ── If Wikipedia content is available, return it directly ─────────────────
+    # llama3.2 is too small to reliably follow strict grounding rules, so for
+    # factual queries we bypass the LLM entirely and serve the Wikipedia text.
+    if wikipedia_excerpt:
+        if gui_app:
+            gui_app.after(0, lambda: gui_app.set_status("Ready"))
+
+        # Take the first 3 non-empty paragraphs from the Wikipedia extract
+        paragraphs = [p.strip() for p in wikipedia_excerpt.split("\n") if len(p.strip()) > 60]
+        summary_text = "  ".join(paragraphs[:3])[:700]
+        return (
+            f"{summary_text}\n\n"
+            + "\n".join(source_lines)
         )
+
+    # ── No Wikipedia — ask Ollama to summarise the scraped content ────────────
+    if gui_app:
+        gui_app.after(0, lambda: gui_app.set_status("Summarising…"))
+
+    summary = None
+    try:
+        cfg = load_config()
+        model = cfg.get("model", "llama3.2")
+        summarise_prompt = (
+            f"The user asked: \"{query}\"\n\n"
+            "=== WEB CONTENT RETRIEVED RIGHT NOW ===\n"
+            f"{raw_context[:6000]}\n"
+            "=== END ===\n\n"
+            "Extract the answer from the web content above. "
+            "State it in 2-3 spoken sentences as Jarvis. "
+            "Use ONLY facts present in the content above — do NOT use training data. "
+            "If the content doesn't answer the question, say so honestly.\n\n"
+            "Answer:"
+        )
+        sum_resp = requests.post(
+            CFG.get("ollama_url", "http://localhost:11434/api/chat").replace("/api/chat", "/api/generate"),
+            json={
+                "model": model,
+                "prompt": summarise_prompt,
+                "stream": False,
+                "options": {"temperature": 0.0, "num_predict": 200},
+            },
+            timeout=60,
+        )
+        sum_resp.raise_for_status()
+        summary = sum_resp.json().get("response", "").strip()
+    except Exception:
+        pass
 
     if gui_app:
         gui_app.after(0, lambda: gui_app.set_status("Ready"))
 
-    return "\n".join(lines)
+    if summary:
+        return summary + "\n\n" + "\n".join(source_lines)
+
+    # Last resort: plain dump
+    plain_lines = [f"🔍 Web results for: \"{query}\"\n"]
+    for chunk in raw_chunks:
+        plain_lines.append("─" * 60)
+        plain_lines.append(chunk + "\n")
+    if not _BS4_OK:
+        plain_lines.append(
+            "💡 Tip: install beautifulsoup4 for richer scraping — "
+            "pip install beautifulsoup4"
+        )
+    return "\n".join(plain_lines)
 
 
 
@@ -2254,6 +2553,7 @@ def dispatch(action: dict) -> str:
     elif a == "web_search":    return web_search(action.get("query",""))
     elif a == "open_link":     return open_link(action.get("url",""))
     elif a == "mouse_move":    return mouse_move(int(action.get("x",0)), int(action.get("y",0)))
+    elif a == "mouse_move_rel": return mouse_move_rel(int(action.get("dx",0)), int(action.get("dy",0)))
     elif a == "mouse_click":   return mouse_click(action.get("x"), action.get("y"), action.get("button","left"), bool(action.get("double",False)))
     elif a == "mouse_scroll":  return mouse_scroll(action.get("direction","down"), int(action.get("amount",3)))
     elif a == "keyboard_type": return keyboard_type(action.get("text",""))
@@ -2397,26 +2697,45 @@ def _direct_intent(t: str, raw: str):
         "right":        (screen_w - 1, screen_h // 2),
     }
     if _re.search(r'(?:move|go|put)\s+(?:the\s+)?(?:mouse|cursor)', t):
-        for name, (x, y) in corner.items():
-            if name in t:
-                return ({"action": "mouse_move", "x": x, "y": y},
-                        f"Moving the cursor to the {name}, sir.")
+        # Match longest name first so "top right" beats bare "right"
+        matched_name = None
+        matched_pos  = None
+        for name, (cx, cy) in sorted(corner.items(), key=lambda kv: -len(kv[0])):
+            pattern = r'\b' + _re.escape(name) + r'\b'
+            if _re.search(pattern, t):
+                matched_name = name
+                matched_pos  = (cx, cy)
+                break
+        if matched_name:
+            x, y = matched_pos
+            return ({"action": "mouse_move", "x": x, "y": y},
+                    f"Moving the cursor to the {matched_name}, sir.")
         nums = _re.findall(r'\d+', t)
         if len(nums) >= 2:
             x, y = int(nums[-2]), int(nums[-1])
             return ({"action": "mouse_move", "x": x, "y": y},
                     f"Moving the cursor to {x}, {y}.")
 
-    if _re.search(r'(?:click|left.click)\s+(?:at\s+)?(\d+)[,\s]+(\d+)', t):
+    if _re.search(r'(?:left.?click|click)\s+(?:at\s+)?(\d+)[,\s]+(\d+)', t):
         m = _re.search(r'(\d+)[,\s]+(\d+)', t)
         x, y = int(m.group(1)), int(m.group(2))
         return ({"action": "mouse_click", "x": x, "y": y, "button": "left"},
-                f"Clicking at {x}, {y}.")
-    if _re.search(r'right.click\s+(?:at\s+)?(\d+)[,\s]+(\d+)', t):
+                f"Left-clicking at {x}, {y}.")
+    if _re.search(r'right.?click\s+(?:at\s+)?(\d+)[,\s]+(\d+)', t):
         m = _re.search(r'(\d+)[,\s]+(\d+)', t)
         x, y = int(m.group(1)), int(m.group(2))
         return ({"action": "mouse_click", "x": x, "y": y, "button": "right"},
                 f"Right-clicking at {x}, {y}.")
+    # "left click the top right" / "click the centre"
+    if _re.search(r'(?:left.?click|click)\s+(?:the\s+)?[\w]', t):
+        for name, (x, y) in corner.items():
+            if name in t:
+                return ({"action": "mouse_click", "x": x, "y": y, "button": "left"},
+                        f"Left-clicking the {name}, sir.")
+    # bare "left click" / "click here" — click at current cursor position
+    if _re.search(r'\b(?:left.?click|click\s+here|left\s+click\s+here)\b', t):
+        return ({"action": "mouse_click", "button": "left"},
+                "Left-clicking at the current cursor position.")
 
     if _re.search(r'scroll\s+(?:the\s+page\s+)?(?:down|up)', t):
         direction = "down" if "down" in t else "up"
@@ -2581,6 +2900,18 @@ def _direct_intent_extended(t: str, raw: str):
         return ({"action": "set_volume", "level": 50 + delta},
                 f"Adjusting volume, sir.")
 
+    # ── Factual / informational catch-all → always web-search, never the LLM ──
+    # Question words and info requests go straight to web_search_read so the
+    # model cannot answer from its (unreliable) training data.
+    _FACTUAL = _re.search(
+        r'^(?:what|who|where|when|why|how|which|give\s+me|tell\s+me|'
+        r'info(?:rmation)?\s+on|look\s+up|find\s+out|do\s+you\s+know)',
+        t.strip()
+    )
+    if _FACTUAL:
+        return ({"action": "web_search_read", "query": raw.strip()},
+                "Looking that up now, sir.")
+
     return None
 
 
@@ -2630,11 +2961,7 @@ def _run_single_command(text: str):
         speak(response)
 
 
-# ─────────────────────────────────────────────
-#  COMMAND HANDLER
-#  IMPORTANT: handle_command must ALWAYS run on a daemon thread, never the
-#  main/GUI thread.  All GUI mutations go through gui_app.after(0, ...).
-# ─────────────────────────────────────────────
+
 def handle_command(text: str):
     if not text:
         return
@@ -3085,11 +3412,12 @@ class SettingsDialog(tk.Toplevel):
 
 
 class SplashScreen(tk.Toplevel):
-    BG     = "#050a0f"
-    ACCENT = "#00b4d8"
+    BG     = "#020d18"
+    ACCENT = "#00d4ff"
+    ACCENT2= "#0077b6"
     ACCENT3= "#48cae4"
     FG     = "#caf0f8"
-    FG_DIM = "#4a7fa5"
+    FG_DIM = "#1a4a6a"
 
     _BOOT_LINES = [
         "INITIALISING J.A.R.V.I.S. ...",
@@ -3097,7 +3425,7 @@ class SplashScreen(tk.Toplevel):
         "CALIBRATING VOICE SYSTEMS ...",
         "SCANNING ENVIRONMENT ...",
         "ESTABLISHING OLLAMA LINK ...",
-        "SYSTEMS ONLINE.",
+        "ALL SYSTEMS ONLINE.",
     ]
 
     def __init__(self, root: tk.Tk):
@@ -3105,222 +3433,425 @@ class SplashScreen(tk.Toplevel):
         self.overrideredirect(True)
         self.attributes("-topmost", True)
         self.configure(bg=self.BG)
-        w, h = 520, 360
-        sw = self.winfo_screenwidth()
-        sh = self.winfo_screenheight()
+        w, h = 600, 420
+        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
         self.geometry(f"{w}x{h}+{(sw-w)//2}+{(sh-h)//2}")
-
-        self._angle      = 0
-        self._line_idx   = 0
-        self._progress   = 0.0
-        self._alive      = True
-        self._fade_alpha = 1.0
-
+        self._angle  = 0
+        self._angle2 = 0
+        self._angle3 = 0
+        self._line_idx = 0
+        self._alive  = True
+        self._scan_y = 0
         self._build()
         self._spin()
         self._advance_text()
+        self._scan()
 
     def _build(self):
-        self.arc_canvas = tk.Canvas(self, width=140, height=140,
-                                     bg=self.BG, highlightthickness=0)
-        self.arc_canvas.pack(pady=(32, 0))
+        self.canvas = tk.Canvas(self, width=600, height=420,
+                                bg=self.BG, highlightthickness=0)
+        self.canvas.pack(fill="both", expand=True)
+        # static labels on canvas
+        self.canvas.create_text(300, 310, text="J.A.R.V.I.S.",
+            font=("Courier New", 26, "bold"), fill=self.ACCENT, tags="title")
+        self.canvas.create_text(300, 338, text="JUST A RATHER VERY INTELLIGENT SYSTEM",
+            font=("Courier New", 7), fill=self.FG_DIM, tags="sub")
+        self._status_id = self.canvas.create_text(300, 368,
+            text=self._BOOT_LINES[0], font=("Courier New", 9), fill=self.ACCENT3)
+        # progress bar background
+        self.canvas.create_rectangle(110, 388, 490, 396,
+            fill="#061220", outline=self.FG_DIM, width=1, tags="progbg")
+        self._prog_bar = self.canvas.create_rectangle(110, 388, 110, 396,
+            fill=self.ACCENT, outline="", tags="prog")
 
-        tk.Label(self, text="J.A.R.V.I.S.", bg=self.BG, fg=self.ACCENT,
-                 font=("Courier New", 22, "bold")).pack(pady=(8, 0))
-        tk.Label(self, text="JUST A RATHER VERY INTELLIGENT SYSTEM",
-                 bg=self.BG, fg=self.FG_DIM,
-                 font=("Courier New", 7)).pack()
+    def _draw_rings(self):
+        c = self.canvas
+        c.delete("ring")
+        cx, cy = 300, 175
+        # outer dim circle
+        for r, col, w in [(130, self.FG_DIM, 1), (108, self.ACCENT2, 1), (82, self.FG_DIM, 1)]:
+            c.create_oval(cx-r, cy-r, cx+r, cy+r, outline=col, width=w, tags="ring")
+        # animated arcs
+        c.create_arc(cx-130, cy-130, cx+130, cy+130,
+            start=self._angle, extent=220, outline=self.ACCENT, width=3,
+            style="arc", tags="ring")
+        c.create_arc(cx-130, cy-130, cx+130, cy+130,
+            start=self._angle+240, extent=60, outline=self.ACCENT3, width=2,
+            style="arc", tags="ring")
+        c.create_arc(cx-108, cy-108, cx+108, cy+108,
+            start=-self._angle2, extent=160, outline=self.ACCENT2, width=2,
+            style="arc", tags="ring")
+        c.create_arc(cx-108, cy-108, cx+108, cy+108,
+            start=-self._angle2+180, extent=80, outline=self.ACCENT3, width=1,
+            style="arc", tags="ring")
+        c.create_arc(cx-82, cy-82, cx+82, cy+82,
+            start=self._angle3, extent=270, outline=self.ACCENT, width=2,
+            style="arc", tags="ring")
+        # tick marks on outer ring
+        for i in range(24):
+            rad = math.radians(i * 15 + self._angle * 0.2)
+            r_in  = 122 if i % 6 == 0 else 126
+            x1 = cx + r_in  * math.cos(rad)
+            y1 = cy + r_in  * math.sin(rad)
+            x2 = cx + 130   * math.cos(rad)
+            y2 = cy + 130   * math.sin(rad)
+            col = self.ACCENT if i % 6 == 0 else self.FG_DIM
+            c.create_line(x1, y1, x2, y2, fill=col, width=1, tags="ring")
+        # spokes on inner ring
+        for i in range(8):
+            rad = math.radians(i * 45 + self._angle2 * 0.5)
+            x2 = cx + 76 * math.cos(rad)
+            y2 = cy + 76 * math.sin(rad)
+            c.create_line(cx, cy, x2, y2, fill=self.FG_DIM, width=1, tags="ring")
+        # core glow
+        glow_r = 28 + 4 * math.sin(math.radians(self._angle * 3))
+        c.create_oval(cx-glow_r, cy-glow_r, cx+glow_r, cy+glow_r,
+            fill=self.ACCENT2, outline=self.ACCENT, width=2, tags="ring")
+        c.create_oval(cx-12, cy-12, cx+12, cy+12,
+            fill=self.ACCENT, outline=self.ACCENT3, width=1, tags="ring")
+        # HUD corner brackets
+        for bx, by, sx, sy in [(40,20,1,1),(560,20,-1,1),(40,400,1,-1),(560,400,-1,-1)]:
+            c.create_line(bx,by, bx+sx*30,by, fill=self.ACCENT2, width=1, tags="ring")
+            c.create_line(bx,by, bx,by+sy*30, fill=self.ACCENT2, width=1, tags="ring")
 
-        self._status_var = tk.StringVar(value=self._BOOT_LINES[0])
-        tk.Label(self, textvariable=self._status_var, bg=self.BG, fg=self.ACCENT3,
-                 font=("Courier New", 9)).pack(pady=(18, 4))
+    def _draw_scan(self):
+        c = self.canvas
+        c.delete("scan")
+        alpha_line = self.canvas.create_line(
+            0, self._scan_y, 600, self._scan_y,
+            fill=self.ACCENT3, width=1, tags="scan")
+        # faint gradient below scan line (simulate with rectangles)
+        for i in range(6):
+            y = self._scan_y + i * 3
+            if y < 420:
+                c.create_rectangle(0, y, 600, y+2,
+                    fill=self.ACCENT2, outline="", tags="scan",
+                    stipple="gray25" if i > 2 else "gray50")
 
-        self.prog_canvas = tk.Canvas(self, width=380, height=6,
-                                      bg="#0a1520", highlightthickness=0)
-        self.prog_canvas.pack()
-        self.prog_bar = self.prog_canvas.create_rectangle(0, 0, 0, 6,
-                                                           fill=self.ACCENT, outline="")
-
-    def _draw_arc(self):
-        c = self.arc_canvas
-        c.delete("all")
-        cx, cy, r_outer, r_inner, r_core = 70, 70, 60, 44, 14
-
-        c.create_oval(cx-r_outer, cy-r_outer, cx+r_outer, cy+r_outer,
-                      outline=self.FG_DIM, width=1)
-        c.create_arc(cx-r_outer+3, cy-r_outer+3,
-                     cx+r_outer-3, cy+r_outer-3,
-                     start=self._angle, extent=270,
-                     outline=self.ACCENT, width=3, style="arc")
-        c.create_oval(cx-r_inner, cy-r_inner, cx+r_inner, cy+r_inner,
-                      outline="#0077b6", width=1)
-        c.create_oval(cx-r_core, cy-r_core, cx+r_core, cy+r_core,
-                      fill=self.ACCENT, outline=self.ACCENT3, width=2)
+    def _scan(self):
+        if not self._alive:
+            return
+        self._scan_y = (self._scan_y + 4) % 420
+        self._draw_scan()
+        self.after(30, self._scan)
 
     def _spin(self):
         if not self._alive:
             return
-        self._angle = (self._angle + 6) % 360
-        self._draw_arc()
+        self._angle  = (self._angle  + 4) % 360
+        self._angle2 = (self._angle2 + 2) % 360
+        self._angle3 = (self._angle3 + 6) % 360
+        self._draw_rings()
+        # keep labels and progress on top
+        self.canvas.tag_raise("title")
+        self.canvas.tag_raise("sub")
+        self.canvas.tag_raise("progbg")
+        self.canvas.tag_raise("prog")
+        self.canvas.tag_raise("scan")
+        self.canvas.lift(self._status_id)
         self.after(16, self._spin)
 
     def _advance_text(self):
         if not self._alive:
             return
         if self._line_idx < len(self._BOOT_LINES):
-            self._status_var.set(self._BOOT_LINES[self._line_idx])
+            self.canvas.itemconfig(self._status_id, text=self._BOOT_LINES[self._line_idx])
             frac = self._line_idx / max(len(self._BOOT_LINES) - 1, 1)
-            self.prog_canvas.coords(self.prog_bar, 0, 0, int(380 * frac), 6)
+            self.canvas.coords(self._prog_bar, 110, 388, 110 + int(380 * frac), 396)
             self._line_idx += 1
             delay = 900 if self._line_idx < len(self._BOOT_LINES) else 400
             self.after(delay, self._advance_text)
 
     def finish(self):
         self._alive = False
-        self._status_var.set("SYSTEMS ONLINE.")
-        self.prog_canvas.coords(self.prog_bar, 0, 0, 380, 6)
-        self._fade()
-
-    def _fade(self):
-        self._fade_alpha -= 0.07
-        if self._fade_alpha <= 0:
-            self.destroy()
-            return
-        try:
-            self.attributes("-alpha", max(0.0, self._fade_alpha))
-        except Exception:
-            pass
-        self.after(30, self._fade)
+        self.destroy()
 
 
 class JarvisApp(tk.Tk):
-    BG       = "#050a0f"
-    PANEL    = "#0a1520"
-    BORDER   = "#1a3a5c"
-    ACCENT   = "#00b4d8"
+    # ── Tron HUD palette ──────────────────────────────────────────────────────
+    BG       = "#020d18"
+    PANEL    = "#040f1e"
+    BORDER   = "#0a2a45"
+    ACCENT   = "#00d4ff"
     ACCENT2  = "#0077b6"
     ACCENT3  = "#48cae4"
-    JARVIS_C = "#00b4d8"
+    JARVIS_C = "#00d4ff"
     USER_C   = "#90e0ef"
-    SYS_C    = "#4a7fa5"
-    FG       = "#caf0f8"
-    FG_DIM   = "#4a7fa5"
-    INPUT_BG = "#0a1a2a"
-    GLOW     = "#00b4d8"
+    SYS_C    = "#2a6a8a"
+    FG       = "#b8e8f8"
+    FG_DIM   = "#1a4a6a"
+    INPUT_BG = "#03111f"
+    ENTRY_BG = "#03111f"
 
     def __init__(self):
         super().__init__()
         self.title("J.A.R.V.I.S.")
         self.configure(bg=self.BG)
-        self.geometry("960x720")
-        self.minsize(700, 500)
+        self.geometry("980x740")
+        self.minsize(720, 520)
 
-        self._pulse_step    = 0
+        # ── HUD animation ────────────────────────────────────────────────────────
+        self._arc_angle  = 0
+        self._arc2_angle = 180
+        self._arc3_angle = 90
         self._pulse_running = False
+        self._pulse_count   = 0
         self._scan_y        = 0
-        self._arc_angle     = 0
+        self._hud_tick      = 0
+
+        # ── Particle system ─────────────────────────────────────────────────────
+        self.particles = []
+        self.max_particles = 80
+        self.speech_active = False
+        self.particle_colors = [
+            "#00d4ff",  # ACCENT
+            "#0077b6",  # ACCENT2
+            "#48cae4",  # ACCENT3
+            "#90e0ef",  # USER_C
+            "#00b4d8",
+            "#0096c7",
+        ]
 
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._tick_clock()
-        self._animate_arc()
+        self._animate_hud()
+        self._animate_scan()
         self.after(100, lambda: _set_window_icon(self))
+        # Initialize particles after a brief delay to ensure UI is ready
+        self.after(200, self._init_particles)
 
+    # ── Particle system methods ─────────────────────────────────────────────────────
+    def _init_particles(self):
+        """Initialize the particle system with floating particles"""
+        import random
+        # Wait until window has proper dimensions (not withdrawn/iconic)
+        width = self.winfo_width()
+        height = self.winfo_height()
+        if width <= 1 or height <= 1:
+            # Window not ready yet, try again in 50ms
+            self.after(50, self._init_particles)
+            return
+
+        self.particles = []
+        for _ in range(self.max_particles):
+            self.particles.append({
+                'x': random.randint(0, width),
+                'y': random.randint(0, height),
+                'vx': random.uniform(-0.5, 0.5),
+                'vy': random.uniform(-1, -0.2),  # float upward
+                'size': random.uniform(1, 3),
+                'life': random.randint(20, 60),
+                'max_life': random.randint(20, 60),
+                'color': random.choice(self.particle_colors),
+                'alpha': 1.0
+            })
+
+    def _update_particles(self):
+        """Update particle positions and handle speech effects"""
+        import random, math
+        width = self.winfo_width()
+        height = self.winfo_height()
+
+        for p in self.particles:
+            # Apply speech effects
+            if self.speech_active:
+                # When speaking, particles move more energetically
+                p['vx'] += random.uniform(-0.5, 0.5) * 0.1
+                p['vy'] += random.uniform(-0.3, 0.3) * 0.1
+                # Occasionally burst outward from center
+                if random.random() < 0.02:
+                    angle = random.uniform(0, 2 * math.pi)
+                    speed = random.uniform(2, 4)
+                    p['vx'] += math.cos(angle) * speed * 0.1
+                    p['vy'] += math.sin(angle) * speed * 0.1
+            else:
+                # Normal gentle float
+                p['vx'] *= 0.99  # slight damping
+                p['vy'] *= 0.99
+                # Add very slight drift
+                p['vx'] += random.uniform(-0.02, 0.02)
+                p['vy'] += random.uniform(-0.01, 0.01)
+
+            # Update position
+            p['x'] += p['vx']
+            p['y'] += p['vy']
+
+            # Wrap around edges
+            if p['x'] < 0:
+                p['x'] = width
+            elif p['x'] > width:
+                p['x'] = 0
+            if p['y'] < 0:
+                p['y'] = height
+            elif p['y'] > height:
+                p['y'] = 0
+
+            # Update life
+            p['life'] -= 1
+            if p['life'] <= 0:
+                # Reset particle
+                p['x'] = random.randint(0, width)
+                p['y'] = random.randint(0, height)
+                p['vx'] = random.uniform(-0.5, 0.5)
+                p['vy'] = random.uniform(-1, -0.2)
+                p['size'] = random.uniform(1, 3)
+                p['life'] = random.randint(20, 60)
+                p['max_life'] = p['life']
+                p['color'] = random.choice(self.particle_colors)
+                p['alpha'] = 1.0
+
+            # Calculate alpha based on life (fade out)
+            p['alpha'] = p['life'] / p['max_life']
+
+    def _draw_particles(self):
+        """Draw all particles to the particle canvas"""
+        if not hasattr(self, 'particle_canvas'):
+            return
+
+        self.particle_canvas.delete("particle")
+
+        for p in self.particles:
+            if p['alpha'] > 0.1:  # Only draw visible particles
+                x, y = int(p['x']), int(p['y'])
+                size = p['size']
+
+                # Vary size based on alpha for a twinkling effect
+                draw_size = size * (0.5 + p['alpha'] * 0.5)
+
+                self.particle_canvas.create_oval(
+                    x - draw_size, y - draw_size,
+                    x + draw_size, y + draw_size,
+                    fill=p['color'], outline="", tags="particle"
+                )
+
+    def _set_speech_active(self, active: bool):
+        """Called when speech starts or stops to update particle behavior"""
+        self.speech_active = active
+        # Optional: trigger a burst when speech starts
+        if active and hasattr(self, 'particle_canvas'):
+            self._speech_burst()
+
+    def _speech_burst(self):
+        """Create a burst of particles when speech starts"""
+        import random, math
+        width = self.winfo_width()
+        height = self.winfo_height()
+        center_x, center_y = width // 2, height // 2
+
+        # Add some burst particles
+        for _ in range(20):
+            angle = random.uniform(0, 2 * math.pi)
+            speed = random.uniform(3, 6)
+            self.particles.append({
+                'x': center_x,
+                'y': center_y,
+                'vx': math.cos(angle) * speed * 0.1,
+                'vy': math.sin(angle) * speed * 0.1,
+                'size': random.uniform(2, 4),
+                'life': random.randint(15, 30),
+                'max_life': random.randint(15, 30),
+                'color': random.choice(self.particle_colors),
+                'alpha': 1.0
+            })
+        # Keep particle count at max by removing excess particles (oldest first)
+        if len(self.particles) > self.max_particles:
+            excess = len(self.particles) - self.max_particles
+            self.particles = self.particles[excess:]
+
+    # ── UI construction ───────────────────────────────────────────────────────
     def _build_ui(self):
-        topbar = tk.Frame(self, bg=self.PANEL, height=64)
-        topbar.pack(fill="x", side="top")
-        topbar.pack_propagate(False)
+        # ── Top HUD bar ───────────────────────────────────────────────────────
+        self.topbar_canvas = tk.Canvas(self, bg=self.PANEL, height=68,
+                                       highlightthickness=0)
+        self.topbar_canvas.pack(fill="x", side="top")
+        self.topbar_canvas.bind("<Configure>", self._redraw_topbar)
 
-        self.canvas_logo = tk.Canvas(topbar, width=52, height=52,
-                                      bg=self.PANEL, highlightthickness=0)
-        self.canvas_logo.pack(side="left", padx=(14, 8), pady=6)
-        self._draw_arc(0)
+        # ── Glowing separator ─────────────────────────────────────────────────
+        sep = tk.Canvas(self, bg=self.BG, height=3, highlightthickness=0)
+        sep.pack(fill="x")
+        self._sep_canvas = sep
+        sep.bind("<Configure>", lambda e: self._draw_sep(e.width))
 
-        title_block = tk.Frame(topbar, bg=self.PANEL)
-        title_block.pack(side="left", pady=6)
-        tk.Label(title_block, text="J.A.R.V.I.S.", bg=self.PANEL, fg=self.ACCENT,
-                 font=("Courier New", 17, "bold")).pack(anchor="w")
-        owner = CFG.get("owner_name", "")
-        sub = f"ONLINE  ·  {owner.upper()}" if owner else "ONLINE"
-        tk.Label(title_block, text=sub, bg=self.PANEL, fg=self.FG_DIM,
-                 font=("Courier New", 8)).pack(anchor="w")
+        # ── Left HUD panel (animated ring) ────────────────────────────────────
+        body_frame = tk.Frame(self, bg=self.BG)
+        body_frame.pack(fill="both", expand=True)
 
-        self._clock_var = tk.StringVar(value="")
-        tk.Label(topbar, textvariable=self._clock_var,
-                 bg=self.PANEL, fg=self.ACCENT3,
-                 font=("Courier New", 11)).pack(side="right", padx=18)
+        # ── Particle Canvas (behind everything) ─────────────────────────────────────
+        self.particle_canvas = tk.Canvas(body_frame, bg=self.BG, highlightthickness=0)
+        self.particle_canvas.place(x=0, y=0, relwidth=1, relheight=1)
 
-        btn_kw = dict(bg=self.PANEL, fg=self.FG_DIM, relief="flat",
-                      font=("Courier New", 9), cursor="hand2",
-                      activebackground=self.BORDER, activeforeground=self.ACCENT,
-                      bd=0, padx=10, pady=8)
-        tk.Button(topbar, text="[ SETTINGS ]", command=self.open_settings, **btn_kw).pack(side="right", padx=2)
-        tk.Button(topbar, text="[ STATUS ]",   command=self._cmd_status,   **btn_kw).pack(side="right", padx=2)
-        tk.Button(topbar, text="[ CLEAR ]",    command=self._cmd_clear,    **btn_kw).pack(side="right", padx=2)
+        self.left_hud = tk.Canvas(body_frame, width=130, bg=self.BG,
+                                  highlightthickness=0)
+        self.left_hud.pack(side="left", fill="y", padx=(6, 0))
 
-        tk.Frame(self, bg=self.ACCENT, height=1).pack(fill="x")
-
-        chat_frame = tk.Frame(self, bg=self.BG)
-        chat_frame.pack(fill="both", expand=True)
+        # ── Chat area ─────────────────────────────────────────────────────────
+        chat_outer = tk.Frame(body_frame, bg=self.BORDER, bd=0)
+        chat_outer.pack(side="left", fill="both", expand=True, padx=6, pady=6)
 
         self.chat = scrolledtext.ScrolledText(
-            chat_frame,
+            chat_outer,
             bg=self.BG, fg=self.FG,
             font=("Courier New", 11),
-            wrap="word",
-            relief="flat",
+            wrap="word", relief="flat",
             state="disabled",
-            padx=20, pady=14,
+            padx=18, pady=12,
             selectbackground=self.BORDER,
             cursor="arrow",
             spacing1=2, spacing3=2,
         )
-        self.chat.pack(fill="both", expand=True)
-
+        self.chat.pack(fill="both", expand=True, padx=1, pady=1)
         self.chat.tag_config("jarvis",      foreground=self.ACCENT,  font=("Courier New", 11, "bold"))
         self.chat.tag_config("jarvis_body", foreground=self.FG,       font=("Courier New", 11))
         self.chat.tag_config("user",        foreground=self.USER_C,   font=("Courier New", 11, "bold"))
         self.chat.tag_config("user_body",   foreground=self.FG,       font=("Courier New", 11))
         self.chat.tag_config("system",      foreground=self.SYS_C,    font=("Courier New", 10))
         self.chat.tag_config("time",        foreground=self.FG_DIM,   font=("Courier New", 9))
-        self.chat.tag_config("divider",     foreground=self.BORDER,   font=("Courier New", 9))
 
-        tk.Frame(self, bg=self.BORDER, height=1).pack(fill="x")
+        # ── Right HUD panel ───────────────────────────────────────────────────
+        self.right_hud = tk.Canvas(body_frame, width=130, bg=self.BG,
+                                   highlightthickness=0)
+        self.right_hud.pack(side="right", fill="y", padx=(0, 6))
 
-        bottom = tk.Frame(self, bg=self.PANEL, height=60)
+        # ── Bottom separator ──────────────────────────────────────────────────
+        bot_sep = tk.Canvas(self, bg=self.BG, height=3, highlightthickness=0)
+        bot_sep.pack(fill="x")
+        bot_sep.bind("<Configure>", lambda e: self._draw_sep(e.width, bot_sep))
+
+        # ── Input bar ─────────────────────────────────────────────────────────
+        bottom = tk.Frame(self, bg=self.PANEL, height=58)
         bottom.pack(fill="x", side="bottom")
         bottom.pack_propagate(False)
 
         self.mic_btn = tk.Button(
-            bottom, text="◉", font=("Courier New", 16),
+            bottom, text="◉", font=("Courier New", 15),
             bg=self.INPUT_BG, fg=self.ACCENT, relief="flat",
-            cursor="hand2", padx=10,
+            cursor="hand2", padx=8,
             activebackground=self.BORDER, activeforeground=self.ACCENT3,
             command=self._toggle_mic
         )
-        self.mic_btn.pack(side="left", padx=(12, 4), pady=10)
+        self.mic_btn.pack(side="left", padx=(10, 3), pady=9)
 
         self.mute_btn = tk.Button(
-            bottom, text="⏹", font=("Courier New", 16),
-            bg=self.INPUT_BG, fg="#ff7b72", relief="flat",
-            cursor="hand2", padx=10,
-            activebackground=self.BORDER, activeforeground="#ff7b72",
+            bottom, text="⏹", font=("Courier New", 15),
+            bg=self.INPUT_BG, fg="#ff6b6b", relief="flat",
+            cursor="hand2", padx=8,
+            activebackground=self.BORDER, activeforeground="#ff6b6b",
             command=self._mute_speech
         )
-        self.mute_btn.pack(side="left", padx=(0, 4), pady=10)
+        self.mute_btn.pack(side="left", padx=(0, 3), pady=9)
 
         self.input_var = tk.StringVar()
         self.input_box = tk.Entry(
             bottom, textvariable=self.input_var,
             bg=self.INPUT_BG, fg=self.ACCENT3,
             insertbackground=self.ACCENT,
-            font=("Courier New", 12),
-            relief="flat",
+            font=("Courier New", 12), relief="flat",
             highlightthickness=1,
             highlightcolor=self.ACCENT,
             highlightbackground=self.BORDER,
         )
-        self.input_box.pack(side="left", fill="x", expand=True, padx=4, pady=10, ipady=7)
+        self.input_box.pack(side="left", fill="x", expand=True, padx=4, pady=9, ipady=7)
         self.input_box.bind("<Return>",   self._on_send)
         self.bind("<Escape>", lambda e: self._mute_speech())
         self.input_box.bind("<FocusIn>",  lambda e: self.input_box.config(highlightbackground=self.ACCENT))
@@ -3330,71 +3861,284 @@ class JarvisApp(tk.Tk):
             bottom, text="EXECUTE ▶",
             bg=self.ACCENT2, fg=self.FG,
             font=("Courier New", 10, "bold"),
-            relief="flat", padx=16, pady=8,
+            relief="flat", padx=14, pady=7,
             cursor="hand2",
             activebackground=self.ACCENT, activeforeground=self.BG,
             command=self._on_send
         )
-        self.send_btn.pack(side="right", padx=12, pady=10)
+        self.send_btn.pack(side="right", padx=10, pady=9)
 
-        self.status_var = tk.StringVar(value="● STANDBY")
+        # ── Status bar ────────────────────────────────────────────────────────
         status_bar = tk.Frame(self, bg=self.BG, height=20)
         status_bar.pack(fill="x", side="bottom")
+        self.status_var = tk.StringVar(value="● STANDBY")
         tk.Label(status_bar, textvariable=self.status_var,
                  bg=self.BG, fg=self.ACCENT, font=("Courier New", 8),
-                 anchor="w").pack(side="left", padx=12)
+                 anchor="w").pack(side="left", padx=10)
         wake = CFG.get("wake_word", "jarvis").upper()
-        tk.Label(status_bar, text=f'SAY "{wake}" TO ACTIVATE VOICE  //  FAILSAFE: MOUSE TOP-LEFT',
-                 bg=self.BG, fg=self.FG_DIM, font=("Courier New", 8)).pack(side="right", padx=12)
+        tk.Label(status_bar,
+                 text=f'SAY "{wake}" TO ACTIVATE VOICE  //  FAILSAFE: MOUSE TOP-LEFT',
+                 bg=self.BG, fg=self.FG_DIM, font=("Courier New", 8)
+                 ).pack(side="right", padx=10)
 
-    def _draw_arc(self, angle: float):
-        c = self.canvas_logo
+    # ── Drawing helpers ───────────────────────────────────────────────────────
+    def _draw_sep(self, w, canvas=None):
+        c = canvas or self._sep_canvas
         c.delete("all")
-        cx, cy, r = 26, 26, 22
-        c.create_oval(cx-r, cy-r, cx+r, cy+r, outline=self.BORDER, width=1)
-        c.create_arc(cx-r, cy-r, cx+r, cy+r,
-                     start=angle, extent=240,
-                     outline=self.ACCENT, width=2, style="arc")
-        r2 = 14
-        c.create_oval(cx-r2, cy-r2, cx+r2, cy+r2, outline=self.ACCENT2, width=1)
-        r3 = 7
-        c.create_oval(cx-r3, cy-r3, cx+r3, cy+r3,
-                      fill=self.ACCENT if self._pulse_running else self.ACCENT2,
-                      outline=self.ACCENT3, width=1)
-        for i in range(6):
-            rad = math.radians(i * 60 + angle * 0.3)
-            x2 = cx + r2 * math.cos(rad)
-            y2 = cy + r2 * math.sin(rad)
-            c.create_line(cx, cy, x2, y2, fill=self.BORDER, width=1)
+        c.create_line(0, 1, w, 1, fill=self.ACCENT2,  width=1)
+        c.create_line(0, 2, w, 2, fill=self.ACCENT,   width=1)
+        c.create_line(0, 3, w, 3, fill=self.ACCENT2,  width=1)
 
-    def _animate_arc(self):
-        self._arc_angle = (self._arc_angle + 2) % 360
-        self._draw_arc(self._arc_angle)
-        self.after(40, self._animate_arc)
+    def _redraw_topbar(self, event=None):
+        self._draw_topbar()
+
+    def _draw_topbar(self):
+        c = self.topbar_canvas
+        c.delete("all")
+        w = c.winfo_width() or 980
+        h = 68
+
+        # background gradient effect (horizontal bands)
+        for i in range(h):
+            shade = int(4 + (i / h) * 8)
+            col = f"#{shade:02x}{shade+4:02x}{shade+8:02x}"
+            c.create_line(0, i, w, i, fill=col)
+
+        # Outer border lines
+        c.create_line(0, 0, w, 0, fill=self.BORDER, width=1)
+        c.create_line(0, h-1, w, h-1, fill=self.ACCENT2, width=1)
+
+        # Animated ring logo (left side)
+        cx, cy, R = 34, 34, 26
+        # outer ring
+        c.create_oval(cx-R, cy-R, cx+R, cy+R, outline=self.FG_DIM, width=1)
+        # spinning arc
+        c.create_arc(cx-R, cy-R, cx+R, cy+R,
+                     start=self._arc_angle, extent=230,
+                     outline=self.ACCENT, width=3, style="arc")
+        c.create_arc(cx-R, cy-R, cx+R, cy+R,
+                     start=self._arc_angle+250, extent=60,
+                     outline=self.ACCENT3, width=1, style="arc")
+        # inner ring
+        r2 = 16
+        c.create_oval(cx-r2, cy-r2, cx+r2, cy+r2, outline=self.ACCENT2, width=1)
+        c.create_arc(cx-r2, cy-r2, cx+r2, cy+r2,
+                     start=-self._arc2_angle, extent=180,
+                     outline=self.ACCENT3, width=1, style="arc")
+        # core
+        r3 = 7 + (2 if self._pulse_running and self._pulse_count % 2 == 0 else 0)
+        c.create_oval(cx-r3, cy-r3, cx+r3, cy+r3,
+                      fill=self.ACCENT, outline=self.ACCENT3, width=1)
+        # tick marks
+        for i in range(12):
+            rad = math.radians(i * 30 + self._arc_angle * 0.4)
+            r_in = R - 3 if i % 3 == 0 else R - 1
+            c.create_line(cx + r_in*math.cos(rad), cy + r_in*math.sin(rad),
+                          cx + R   *math.cos(rad), cy + R   *math.sin(rad),
+                          fill=self.ACCENT if i % 3 == 0 else self.FG_DIM, width=1)
+
+        # Title text
+        c.create_text(76, 22, text="J.A.R.V.I.S.", anchor="w",
+                      font=("Courier New", 18, "bold"), fill=self.ACCENT)
+        owner = CFG.get("owner_name", "")
+        sub = f"ONLINE  ·  {owner.upper()}" if owner else "ONLINE"
+        c.create_text(76, 44, text=sub, anchor="w",
+                      font=("Courier New", 8), fill=self.FG_DIM)
+
+        # Clock (right side)
+        now = datetime.now()
+        c.create_text(w - 16, 22, text=now.strftime("%H:%M:%S"), anchor="e",
+                      font=("Courier New", 14, "bold"), fill=self.ACCENT)
+        c.create_text(w - 16, 42, text=now.strftime("%d %b %Y"), anchor="e",
+                      font=("Courier New", 9), fill=self.FG_DIM)
+
+        # Top-bar buttons (drawn as HUD elements)
+        btn_x = w - 180
+        for label, cmd in [("[ CLEAR ]", self._cmd_clear),
+                            ("[ STATUS ]", self._cmd_status),
+                            ("[ SETTINGS ]", self.open_settings)]:
+            tag = f"btn_{label}"
+            c.create_text(btn_x, 54, text=label, anchor="e",
+                          font=("Courier New", 8), fill=self.FG_DIM, tags=tag)
+            c.tag_bind(tag, "<Enter>",
+                       lambda e, t=tag: self.topbar_canvas.itemconfig(t, fill=self.ACCENT))
+            c.tag_bind(tag, "<Leave>",
+                       lambda e, t=tag: self.topbar_canvas.itemconfig(t, fill=self.FG_DIM))
+            c.tag_bind(tag, "<Button-1>", lambda e, fn=cmd: fn())
+            btn_x -= 90
+
+        # Scanning line across topbar
+        scan_y = int(self._scan_y * (h / 740))
+        if scan_y < h:
+            c.create_line(0, scan_y, w, scan_y, fill=self.ACCENT3,
+                          width=1, stipple="gray50")
+
+        # Corner HUD brackets
+        blen = 18
+        for bx, by, sx, sy in [(0,0,1,1),(w-1,0,-1,1),(0,h-1,1,-1),(w-1,h-1,-1,-1)]:
+            c.create_line(bx, by, bx+sx*blen, by,       fill=self.ACCENT, width=2)
+            c.create_line(bx, by, bx,         by+sy*blen, fill=self.ACCENT, width=2)
+
+    def _draw_left_hud(self):
+        c = self.left_hud
+        c.delete("all")
+        h = c.winfo_height() or 600
+        cx, cy, R = 65, 110, 52
+
+        # Outer rings
+        c.create_oval(cx-R, cy-R, cx+R, cy+R, outline=self.FG_DIM, width=1)
+        c.create_arc(cx-R, cy-R, cx+R, cy+R,
+                     start=self._arc_angle, extent=200,
+                     outline=self.ACCENT, width=2, style="arc")
+        c.create_arc(cx-R, cy-R, cx+R, cy+R,
+                     start=self._arc_angle+220, extent=80,
+                     outline=self.ACCENT3, width=1, style="arc")
+        r2 = 34
+        c.create_oval(cx-r2, cy-r2, cx+r2, cy+r2, outline=self.ACCENT2, width=1)
+        c.create_arc(cx-r2, cy-r2, cx+r2, cy+r2,
+                     start=-self._arc3_angle, extent=150,
+                     outline=self.ACCENT3, width=1, style="arc")
+        # tick marks
+        for i in range(16):
+            rad = math.radians(i * 22.5 + self._arc_angle * 0.3)
+            r_in = R - 5 if i % 4 == 0 else R - 2
+            c.create_line(cx + r_in*math.cos(rad), cy + r_in*math.sin(rad),
+                          cx + R  *math.cos(rad),  cy + R  *math.sin(rad),
+                          fill=self.ACCENT if i % 4 == 0 else self.FG_DIM, width=1)
+        # spokes
+        for i in range(6):
+            rad = math.radians(i * 60 + self._arc2_angle * 0.4)
+            c.create_line(cx, cy, cx+28*math.cos(rad), cy+28*math.sin(rad),
+                          fill=self.BORDER, width=1)
+        # core
+        glow = 10 + 3 * abs(math.sin(math.radians(self._hud_tick * 3)))
+        c.create_oval(cx-glow, cy-glow, cx+glow, cy+glow,
+                      fill=self.ACCENT2, outline=self.ACCENT, width=1)
+        c.create_oval(cx-5, cy-5, cx+5, cy+5, fill=self.ACCENT, outline="")
+
+        # HUD data readouts below the ring
+        y0 = cy + R + 18
+        try:
+            cpu = psutil.cpu_percent()
+            ram = psutil.virtual_memory().percent
+        except Exception:
+            cpu, ram = 0.0, 0.0
+        # CPU bar
+        c.create_text(10, y0, text="CPU", anchor="w",
+                      font=("Courier New", 7), fill=self.FG_DIM)
+        c.create_text(120, y0, text=f"{cpu:.0f}%", anchor="e",
+                      font=("Courier New", 7), fill=self.ACCENT)
+        c.create_rectangle(10, y0+10, 120, y0+16, fill=self.BORDER, outline="")
+        c.create_rectangle(10, y0+10, 10+int(110*(cpu/100)), y0+16,
+                           fill=self.ACCENT, outline="")
+        # RAM bar
+        y1 = y0 + 28
+        c.create_text(10, y1, text="RAM", anchor="w",
+                      font=("Courier New", 7), fill=self.FG_DIM)
+        c.create_text(120, y1, text=f"{ram:.0f}%", anchor="e",
+                      font=("Courier New", 7), fill=self.ACCENT3)
+        c.create_rectangle(10, y1+10, 120, y1+16, fill=self.BORDER, outline="")
+        c.create_rectangle(10, y1+10, 10+int(110*(ram/100)), y1+16,
+                           fill=self.ACCENT3, outline="")
+
+        # vertical left-border line
+        c.create_line(128, 0, 128, h, fill=self.BORDER, width=1)
+
+        # Scan line
+        scan_frac = (self._scan_y % h)
+        c.create_line(0, scan_frac, 130, scan_frac, fill=self.ACCENT2,
+                      width=1, stipple="gray50")
+
+    def _draw_right_hud(self):
+        c = self.right_hud
+        c.delete("all")
+        h = c.winfo_height() or 600
+        cx, cy, R = 65, 110, 52
+
+        # Outer ring (counter-rotating)
+        c.create_oval(cx-R, cy-R, cx+R, cy+R, outline=self.FG_DIM, width=1)
+        c.create_arc(cx-R, cy-R, cx+R, cy+R,
+                     start=-self._arc_angle, extent=200,
+                     outline=self.ACCENT3, width=2, style="arc")
+        c.create_arc(cx-R, cy-R, cx+R, cy+R,
+                     start=-self._arc_angle+220, extent=80,
+                     outline=self.ACCENT2, width=1, style="arc")
+        r2 = 34
+        c.create_oval(cx-r2, cy-r2, cx+r2, cy+r2, outline=self.ACCENT2, width=1)
+        c.create_arc(cx-r2, cy-r2, cx+r2, cy+r2,
+                     start=self._arc3_angle, extent=150,
+                     outline=self.ACCENT, width=1, style="arc")
+        for i in range(16):
+            rad = math.radians(i * 22.5 - self._arc_angle * 0.3)
+            r_in = R - 5 if i % 4 == 0 else R - 2
+            c.create_line(cx + r_in*math.cos(rad), cy + r_in*math.sin(rad),
+                          cx + R  *math.cos(rad),  cy + R  *math.sin(rad),
+                          fill=self.ACCENT3 if i % 4 == 0 else self.FG_DIM, width=1)
+        for i in range(6):
+            rad = math.radians(i * 60 - self._arc2_angle * 0.4)
+            c.create_line(cx, cy, cx+28*math.cos(rad), cy+28*math.sin(rad),
+                          fill=self.BORDER, width=1)
+        glow = 10 + 3 * abs(math.cos(math.radians(self._hud_tick * 3)))
+        c.create_oval(cx-glow, cy-glow, cx+glow, cy+glow,
+                      fill=self.ACCENT2, outline=self.ACCENT3, width=1)
+        c.create_oval(cx-5, cy-5, cx+5, cy+5, fill=self.ACCENT3, outline="")
+
+        # Clock
+        y0 = cy + R + 18
+        now = datetime.now()
+        c.create_text(65, y0, text=now.strftime("%H:%M"),
+                      font=("Courier New", 13, "bold"), fill=self.ACCENT, anchor="center")
+        c.create_text(65, y0+20, text=now.strftime("%S"),
+                      font=("Courier New", 9), fill=self.FG_DIM, anchor="center")
+        c.create_text(65, y0+36, text=now.strftime("%d %b"),
+                      font=("Courier New", 7), fill=self.FG_DIM, anchor="center")
+
+        # vertical right-border line
+        c.create_line(2, 0, 2, h, fill=self.BORDER, width=1)
+
+        # Scan line
+        scan_frac = (self._scan_y % h)
+        c.create_line(0, scan_frac, 130, scan_frac, fill=self.ACCENT2,
+                      width=1, stipple="gray50")
+
+    # ── Animation loops ───────────────────────────────────────────────────────
+    def _animate_hud(self):
+        self._arc_angle  = (self._arc_angle  + 2) % 360
+        self._arc2_angle = (self._arc2_angle + 1) % 360
+        self._arc3_angle = (self._arc3_angle + 3) % 360
+        self._hud_tick  += 1
+        if self._pulse_running:
+            self._pulse_count += 1
+            if self._pulse_count > 12:
+                self._pulse_running = False
+                self._pulse_count   = 0
+
+        # Update and draw particles
+        self._update_particles()
+        self._draw_particles()
+
+        self._draw_topbar()
+        self._draw_left_hud()
+        self._draw_right_hud()
+        self.after(33, self._animate_hud)   # ~30 fps
+
+    def _animate_scan(self):
+        self._scan_y = (self._scan_y + 3) % max(self.winfo_height(), 600)
+        self.after(20, self._animate_scan)
 
     def _tick_clock(self):
-        now = datetime.now()
-        self._clock_var.set(now.strftime("%H:%M:%S  //  %d %b %Y"))
+        # Clock is now drawn inside _draw_topbar / _draw_right_hud
         self.after(1000, self._tick_clock)
 
+    # ── Wake flash ────────────────────────────────────────────────────────────
     def flash_wake(self):
-        if self._pulse_running:
-            return
         self._pulse_running = True
-        self._pulse_count = 0
-        self._pulse_flash()
+        self._pulse_count   = 0
 
-    def _pulse_flash(self):
-        if self._pulse_count < 6:
-            self._pulse_count += 1
-            self.after(150, self._pulse_flash)
-        else:
-            self._pulse_running = False
-
+    # ── Message display ───────────────────────────────────────────────────────
     def add_message(self, sender: str, text: str, tag: str = "system"):
         self.chat.configure(state="normal")
         ts = datetime.now().strftime("%H:%M:%S")
-
         if tag == "jarvis":
             self.chat.insert("end", f"\n  ◈ J.A.R.V.I.S.  ", "jarvis")
             self.chat.insert("end", f"[{ts}]\n", "time")
@@ -3405,7 +4149,6 @@ class JarvisApp(tk.Tk):
             self.chat.insert("end", f"  {text}\n", "user_body")
         else:
             self.chat.insert("end", f"\n  // {text}\n", "system")
-
         self.chat.configure(state="disabled")
         self.chat.see("end")
 
@@ -3415,34 +4158,30 @@ class JarvisApp(tk.Tk):
         self.status_var.set(f"{prefix} {msg.upper()}")
         self.update_idletasks()
 
+    # ── Event handlers ────────────────────────────────────────────────────────
     def _on_send(self, event=None):
         text = self.input_var.get().strip()
         if not text:
             return
         self.input_var.set("")
         self.add_message("You", text, tag="user")
-        # Always dispatch to a daemon thread — never block the GUI thread
-        threading.Thread(
-            target=handle_command, args=(text,), daemon=True, name="cmd-gui"
-        ).start()
+        threading.Thread(target=handle_command, args=(text,),
+                         daemon=True, name="cmd-gui").start()
 
     def _toggle_mic(self):
         global listening
         listening = not listening
-        self.mic_btn.config(fg=self.ACCENT if listening else "#ff7b72")
+        self.mic_btn.config(fg=self.ACCENT if listening else "#ff6b6b")
         self.set_status(f"Wake word: {'active' if listening else 'muted'}")
 
     def _toggle_mute_speech(self):
-        """Toggle persistent speech mute. Only this button can unmute."""
         global _speech_muted
         if _speech_muted:
-            # Unmute
             _speech_muted = False
             _tts_stop_event.clear()
-            self.mute_btn.config(fg="#ff7b72", text="⏹")
+            self.mute_btn.config(fg="#ff6b6b", text="⏹")
             self.set_status("Speech unmuted")
         else:
-            # Mute — stop immediately and stay muted
             _speech_muted = True
             interrupt_speech()
             self.mute_btn.config(fg=self.ACCENT, text="▶")
@@ -3452,9 +4191,8 @@ class JarvisApp(tk.Tk):
         self._toggle_mute_speech()
 
     def _cmd_status(self):
-        threading.Thread(
-            target=lambda: handle_command("status"), daemon=True, name="cmd-status"
-        ).start()
+        threading.Thread(target=lambda: handle_command("status"),
+                         daemon=True, name="cmd-status").start()
 
     def _cmd_clear(self):
         chat_history.clear()
@@ -3468,10 +4206,8 @@ class JarvisApp(tk.Tk):
 
     def _on_close(self):
         self.withdraw()
-        desktop_notify(
-            "JARVIS — Running in background",
-            "J.A.R.V.I.S. is still active. Use the tray icon to restore or quit."
-        )
+        desktop_notify("JARVIS — Running in background",
+                       "J.A.R.V.I.S. is still active. Use the tray icon to restore or quit.")
 
 
 
