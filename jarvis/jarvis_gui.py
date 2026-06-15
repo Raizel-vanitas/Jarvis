@@ -375,20 +375,25 @@ def voice_confirm(prompt: str) -> bool:
 
 
 
-def _make_recognizer() -> sr.Recognizer:
+def _make_recognizer(wake_word_mode: bool = False) -> sr.Recognizer:
     r = sr.Recognizer()
-    r.energy_threshold         = 300
+    # Lower threshold = more sensitive to quiet speech.
+    # Wake word mode uses a more aggressive setting so soft utterances are caught.
+    r.energy_threshold         = 150 if wake_word_mode else 200
     r.dynamic_energy_threshold = True
+    r.dynamic_energy_adjustment_damping = 0.12   # adapts faster to room noise
+    r.pause_threshold          = 0.6             # shorter pause = snappier cutoff
+    r.non_speaking_duration    = 0.4
     return r
 
 
 def _capture_audio_sounddevice(duration: float = 5, samplerate: int = 16000) -> sr.AudioData:
     """Record audio via sounddevice with voice activity detection."""
-    CHUNK       = int(samplerate * 0.1)   
-    SILENCE_DB  = 30                      
-    MIN_SPEECH  = 0.3                     
-    MAX_SILENCE = 1.5                      
-    MAX_TOTAL   = 15.0                     
+    CHUNK       = int(samplerate * 0.1)
+    SILENCE_DB  = 80    # RMS threshold — higher = less background noise triggers
+    MIN_SPEECH  = 0.2   # seconds of speech before we start recording
+    MAX_SILENCE = 1.2   # seconds of silence after speech before cutting off
+    MAX_TOTAL   = 15.0  # hard cap
 
     frames        = []
     speech_frames = 0
@@ -421,23 +426,23 @@ def _capture_audio_sounddevice(duration: float = 5, samplerate: int = 16000) -> 
 
 
 def listen_for_command(prompt_text: str | None = None) -> str | None:
-    mic_index = CFG.get("mic_index")
-    recognizer = _make_recognizer()
+    mic_index = CFG.get("mic_index")   # always read live from CFG
+    recognizer = _make_recognizer(wake_word_mode=False)
 
     if gui_app and prompt_text:
         gui_app.after(0, lambda: gui_app.set_status(f"🎤 {prompt_text}"))
 
     try:
         if _SOUNDDEVICE_OK:
-            if _sd.default.device[0] is None and mic_index is not None:
-                _sd.default.device = mic_index
+            if mic_index is not None:
+                _sd.default.device = mic_index   # always apply current selection
             if gui_app:
                 gui_app.after(0, lambda: gui_app.set_status("🎤 Listening… (speak now)"))
             audio = _capture_audio_sounddevice()
         else:
             with sr.Microphone(device_index=mic_index) as source:
-                recognizer.adjust_for_ambient_noise(source, duration=0.5)
-                audio = recognizer.listen(source, timeout=8, phrase_time_limit=15)
+                recognizer.adjust_for_ambient_noise(source, duration=0.3)
+                audio = recognizer.listen(source, timeout=10, phrase_time_limit=20)
 
         raw_text = recognizer.recognize_google(audio).lower()
         corrected_text, changes = _apply_corrections(raw_text)
@@ -567,24 +572,32 @@ def _format_did_you_mean(original: str, corrected: str, changes: list[tuple[str,
 
 def wake_word_loop():
     global listening
-    mic_index  = CFG.get("mic_index")
-    wake_word  = CFG.get("wake_word", "jarvis")
-    owner      = CFG.get("owner_name", "")
-    recognizer = _make_recognizer()
+    # Calibrate ambient noise once at startup, then reuse the threshold.
+    # Re-calibrate every ~60 loops (~60 s) to adapt to changing environments.
+    _calib_counter = 0
+    _calib_interval = 60
+    recognizer = _make_recognizer(wake_word_mode=True)
 
     while running:
         if not listening:
             time.sleep(0.5)
             continue
+
+        # Always read live from CFG so settings changes take effect immediately
+        mic_index = CFG.get("mic_index")
+        wake_word = CFG.get("wake_word", "jarvis")
+
         try:
             if _SOUNDDEVICE_OK:
-                if _sd.default.device[0] is None and mic_index is not None:
-                    _sd.default.device = mic_index
+                _sd.default.device = mic_index  # always update, not just when None
                 audio = _capture_audio_sounddevice(duration=3)
             else:
                 with sr.Microphone(device_index=mic_index) as source:
-                    recognizer.adjust_for_ambient_noise(source, duration=0.3)
-                    audio = recognizer.listen(source, timeout=3, phrase_time_limit=4)
+                    # Only re-calibrate periodically, not every loop
+                    if _calib_counter % _calib_interval == 0:
+                        recognizer.adjust_for_ambient_noise(source, duration=0.5)
+                    _calib_counter += 1
+                    audio = recognizer.listen(source, timeout=5, phrase_time_limit=6)
 
             text = recognizer.recognize_google(audio).lower()
             corrected, _chg = _apply_corrections(text)
