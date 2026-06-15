@@ -2961,7 +2961,11 @@ def _run_single_command(text: str):
         speak(response)
 
 
-
+# ─────────────────────────────────────────────
+#  COMMAND HANDLER
+#  IMPORTANT: handle_command must ALWAYS run on a daemon thread, never the
+#  main/GUI thread.  All GUI mutations go through gui_app.after(0, ...).
+# ─────────────────────────────────────────────
 def handle_command(text: str):
     if not text:
         return
