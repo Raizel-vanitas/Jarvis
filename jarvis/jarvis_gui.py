@@ -1,4 +1,16 @@
-from playsound import playsound
+try:
+    from playsound import playsound as _playsound_orig
+    def playsound(path): _playsound_orig(path)
+except ImportError:
+    def playsound(path):
+        try:
+            import pygame as _pg
+            _pg.mixer.music.load(path)
+            _pg.mixer.music.play()
+            while _pg.mixer.music.get_busy():
+                import time; time.sleep(0.05)
+        except Exception as _e:
+            print(f"[playsound fallback] {_e}")
 import os, sys, json, re, shutil, time, threading, subprocess, webbrowser, math
 from jarvis_learning import (
     lookup_learned, teach_jarvis, forget_trigger,
@@ -3261,8 +3273,9 @@ class SettingsDialog(tk.Toplevel):
         super().__init__(parent)
         self.title("JARVIS — Settings")
         self.configure(bg=self.BG)
-        self.resizable(False, False)
-        self.geometry("440x560")
+        self.resizable(True, True)
+        self.geometry("480x620")
+        self.minsize(460, 560)
         self.grab_set()
 
         self.result = None
@@ -3283,14 +3296,23 @@ class SettingsDialog(tk.Toplevel):
         return e
 
     def _build(self):
-        self.resizable(True, True)
-        self.geometry("460x580")
-
+        # ── header ────────────────────────────────────────────────────────────
         header = tk.Frame(self, bg=self.PANEL, height=56)
         header.pack(fill="x")
         tk.Label(header, text="⚙  Settings", bg=self.PANEL, fg=self.ACCENT,
                  font=("Segoe UI", 14, "bold")).pack(side="left", padx=16, pady=12)
 
+        # ── bottom button bar (packed BEFORE body so it stays pinned) ─────────
+        btn_frame = tk.Frame(self, bg=self.BG)
+        btn_frame.pack(side="bottom", fill="x", padx=16, pady=12)
+        tk.Button(btn_frame, text="Save", bg=self.ACCENT, fg="#0d1117",
+                  font=("Segoe UI", 10, "bold"), relief="flat", padx=20, pady=8,
+                  cursor="hand2", command=self._save).pack(side="right", padx=4)
+        tk.Button(btn_frame, text="Cancel", bg="#21262d", fg=self.FG,
+                  font=("Segoe UI", 10), relief="flat", padx=20, pady=8,
+                  cursor="hand2", command=self.destroy).pack(side="right", padx=4)
+
+        # ── scrollable body ───────────────────────────────────────────────────
         body = tk.Frame(self, bg=self.BG)
         body.pack(fill="both", expand=True)
 
@@ -3320,6 +3342,7 @@ class SettingsDialog(tk.Toplevel):
 
         form.columnconfigure(1, weight=1)
 
+        # ── fields ────────────────────────────────────────────────────────────
         self._label(form, "Your name", 0)
         self.name_var = self._entry(form, 0, CFG.get("owner_name", ""))
 
@@ -3338,41 +3361,103 @@ class SettingsDialog(tk.Toplevel):
         self._label(form, "RAM alert %", 5)
         self.ram_var = self._entry(form, 5, str(CFG.get("ram_alert", 90)))
 
+        # ── microphone row ────────────────────────────────────────────────────
         self._label(form, "Microphone", 6)
-        mics = _list_microphones()
 
-        self.mic_cb = ttk.Combobox(form, state="readonly", width=27,
-                                    font=("Segoe UI", 10))
-        self.mic_cb["values"] = [f"[{i}] {n}" for i, n in mics] if mics else ["(no mics found)"]
-        cur_mic = CFG.get("mic_index")
-        if cur_mic is not None and mics:
-            pos = next((pos for pos, (dev_idx, _) in enumerate(mics) if dev_idx == cur_mic), 0)
-            self.mic_cb.current(pos)
-        elif mics:
-            self.mic_cb.current(0)
-        self.mic_cb.grid(row=6, column=1, padx=12, pady=6, sticky="ew")
-        self._mic_list = mics
+        mic_frame = tk.Frame(form, bg=self.PANEL)
+        mic_frame.grid(row=6, column=1, padx=12, pady=6, sticky="ew")
+        mic_frame.columnconfigure(0, weight=1)
 
-        self._label(form, "Start on boot", 7)
+        self._mic_list = _list_microphones()
+        self.mic_cb = ttk.Combobox(mic_frame, state="readonly", font=("Segoe UI", 10))
+        self.mic_cb.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        self._populate_mic_combobox()
+
+        # Refresh button — re-scans for mics
+        tk.Button(mic_frame, text="↺", bg="#21262d", fg=self.ACCENT,
+                  font=("Segoe UI", 11, "bold"), relief="flat", width=3,
+                  cursor="hand2", command=self._refresh_mics,
+                  activebackground="#30363d", activeforeground=self.ACCENT
+                  ).grid(row=0, column=1, padx=(0, 2))
+
+        # Test button — records 2 s and shows whether audio was heard
+        self._test_btn = tk.Button(mic_frame, text="Test", bg="#21262d", fg=self.FG,
+                  font=("Segoe UI", 9), relief="flat", padx=6,
+                  cursor="hand2", command=self._test_mic,
+                  activebackground="#30363d", activeforeground=self.ACCENT)
+        self._test_btn.grid(row=0, column=2)
+
+        # Status label shown after test
+        self._mic_status = tk.Label(form, text="", bg=self.PANEL,
+                                    fg=self.ACCENT, font=("Segoe UI", 9, "italic"))
+        self._mic_status.grid(row=7, column=1, padx=12, sticky="w")
+
+        # ── startup checkbox ──────────────────────────────────────────────────
+        self._label(form, "Start on boot", 8)
         self._startup_var = tk.BooleanVar(value=is_startup_registered())
         tk.Checkbutton(form, variable=self._startup_var,
                        bg=self.PANEL, fg=self.FG, selectcolor=self.ENTRY_BG,
                        activebackground=self.PANEL, activeforeground=self.ACCENT,
                        font=("Segoe UI", 10), relief="flat",
                        text="Launch JARVIS at Windows login"
-                       ).grid(row=7, column=1, padx=12, pady=6, sticky="w")
+                       ).grid(row=8, column=1, padx=12, pady=6, sticky="w")
 
-        body.pack_forget()
-        btn_frame = tk.Frame(self, bg=self.BG)
-        btn_frame.pack(side="bottom", fill="x", padx=16, pady=12)
-        body.pack(fill="both", expand=True)
+    def _populate_mic_combobox(self):
+        """Fill the combobox from self._mic_list and restore saved selection."""
+        mics = self._mic_list
+        if mics:
+            self.mic_cb["values"] = [f"[{i}] {n}" for i, n in mics]
+            cur_mic = CFG.get("mic_index")
+            if cur_mic is not None:
+                pos = next((p for p, (dev_idx, _) in enumerate(mics) if dev_idx == cur_mic), 0)
+            else:
+                pos = 0
+            self.mic_cb.current(pos)
+        else:
+            self.mic_cb["values"] = ["(no microphones found)"]
+            self.mic_cb.current(0)
 
-        tk.Button(btn_frame, text="Save", bg=self.ACCENT, fg="#0d1117",
-                  font=("Segoe UI", 10, "bold"), relief="flat", padx=20, pady=8,
-                  cursor="hand2", command=self._save).pack(side="right", padx=4)
-        tk.Button(btn_frame, text="Cancel", bg="#21262d", fg=self.FG,
-                  font=("Segoe UI", 10), relief="flat", padx=20, pady=8,
-                  cursor="hand2", command=self.destroy).pack(side="right", padx=4)
+    def _refresh_mics(self):
+        """Re-scan microphones and repopulate the dropdown."""
+        self._mic_list = _list_microphones()
+        self._populate_mic_combobox()
+        count = len(self._mic_list)
+        self._mic_status.config(
+            fg=self.ACCENT if count else "#ff6b6b",
+            text=f"Found {count} mic(s)." if count else "No microphones detected."
+        )
+
+    def _test_mic(self):
+        """Quick 2-second listen to verify the selected mic picks up audio."""
+        sel = self.mic_cb.current()
+        if sel < 0 or not self._mic_list:
+            self._mic_status.config(fg="#ff6b6b", text="Select a mic first.")
+            return
+
+        mic_idx = self._mic_list[sel][0]
+        self._test_btn.config(state="disabled", text="…")
+        self._mic_status.config(fg=self.ACCENT, text="Listening for 2 s — say something…")
+        self.update_idletasks()
+
+        def _do_test():
+            try:
+                r = sr.Recognizer()
+                r.energy_threshold = 200
+                r.dynamic_energy_threshold = True
+                with sr.Microphone(device_index=mic_idx) as src:
+                    r.adjust_for_ambient_noise(src, duration=0.3)
+                    audio = r.listen(src, timeout=3, phrase_time_limit=2)
+                # If we got here, audio was captured successfully
+                msg = ("✔ Mic working — audio captured.", "#3fb950")
+            except sr.WaitTimeoutError:
+                msg = ("✘ Nothing heard — check mic or try another.", "#ff6b6b")
+            except Exception as e:
+                msg = (f"✘ Error: {e}", "#ff6b6b")
+
+            self.after(0, lambda: self._mic_status.config(fg=msg[1], text=msg[0]))
+            self.after(0, lambda: self._test_btn.config(state="normal", text="Test"))
+
+        threading.Thread(target=_do_test, daemon=True, name="mic-test").start()
 
     def _save(self):
         global CFG
@@ -3766,10 +3851,34 @@ class JarvisApp(tk.Tk):
     # ── UI construction ───────────────────────────────────────────────────────
     def _build_ui(self):
         # ── Top HUD bar ───────────────────────────────────────────────────────
-        self.topbar_canvas = tk.Canvas(self, bg=self.PANEL, height=68,
-                                       highlightthickness=0)
-        self.topbar_canvas.pack(fill="x", side="top")
+        # ── Top HUD bar (canvas for animation) ───────────────────────────────
+        self._topbar_frame = tk.Frame(self, bg=self.PANEL, height=68)
+        self._topbar_frame.pack(fill="x", side="top")
+        self._topbar_frame.pack_propagate(False)
+
+        self.topbar_canvas = tk.Canvas(self._topbar_frame, bg=self.PANEL,
+                                       height=68, highlightthickness=0)
+        self.topbar_canvas.place(x=0, y=0, relwidth=1, relheight=1)
         self.topbar_canvas.bind("<Configure>", self._redraw_topbar)
+
+        # ── Clickable HUD buttons placed over the canvas ──────────────────────
+        _btn_bar = tk.Frame(self._topbar_frame, bg=self.PANEL)
+        _btn_bar.place(relx=1.0, rely=1.0, anchor="se")
+
+        for label, cmd in [("SETTINGS", self.open_settings),
+                            ("STATUS",   self._cmd_status),
+                            ("CLEAR",    self._cmd_clear)]:
+            btn = tk.Button(
+                _btn_bar, text=f"[ {label} ]",
+                bg=self.PANEL, fg=self.FG_DIM,
+                font=("Courier New", 8), relief="flat",
+                cursor="hand2", bd=0, padx=6, pady=5,
+                activebackground=self.PANEL, activeforeground=self.ACCENT,
+                command=cmd,
+            )
+            btn.pack(side="right", padx=2)
+            btn.bind("<Enter>", lambda e, b=btn: b.config(fg=self.ACCENT))
+            btn.bind("<Leave>", lambda e, b=btn: b.config(fg=self.FG_DIM))
 
         # ── Glowing separator ─────────────────────────────────────────────────
         sep = tk.Canvas(self, bg=self.BG, height=3, highlightthickness=0)
@@ -3955,21 +4064,6 @@ class JarvisApp(tk.Tk):
                       font=("Courier New", 14, "bold"), fill=self.ACCENT)
         c.create_text(w - 16, 42, text=now.strftime("%d %b %Y"), anchor="e",
                       font=("Courier New", 9), fill=self.FG_DIM)
-
-        # Top-bar buttons (drawn as HUD elements)
-        btn_x = w - 180
-        for label, cmd in [("[ CLEAR ]", self._cmd_clear),
-                            ("[ STATUS ]", self._cmd_status),
-                            ("[ SETTINGS ]", self.open_settings)]:
-            tag = f"btn_{label}"
-            c.create_text(btn_x, 54, text=label, anchor="e",
-                          font=("Courier New", 8), fill=self.FG_DIM, tags=tag)
-            c.tag_bind(tag, "<Enter>",
-                       lambda e, t=tag: self.topbar_canvas.itemconfig(t, fill=self.ACCENT))
-            c.tag_bind(tag, "<Leave>",
-                       lambda e, t=tag: self.topbar_canvas.itemconfig(t, fill=self.FG_DIM))
-            c.tag_bind(tag, "<Button-1>", lambda e, fn=cmd: fn())
-            btn_x -= 90
 
         # Scanning line across topbar
         scan_y = int(self._scan_y * (h / 740))
